@@ -1,0 +1,258 @@
+"""Delta-neutral hedging via perpetual futures short.
+
+In live mode: opens/adjusts short futures position to offset spot inventory drift.
+In paper mode: simulates the hedge alongside virtual spot inventory and tracks
+mark-to-market PnL so we can see what the hedge would have saved.
+
+Funding fees accrue every 8h (assumed 0.01%/8h average — adjustable).
+"""
+import asyncio
+import json
+import os
+import time
+from collections import defaultdict
+from dataclasses import dataclass
+
+from logsetup import get_logger
+log = get_logger("hedge")
+
+
+@dataclass
+class HedgeConfig:
+    enabled: bool = True
+    futures_exchange: str = "bingx"        # which ex to route futures on (live)
+    funding_rate_8h: float = 0.0001        # 0.01% / 8h average (paper sim)
+    state_path: str = "hedge_state.json"
+    min_hedge_qty_usd: float = 5.0         # don't bother hedging dust
+    leverage: int = 1                      # always 1x — no liquidation headroom games
+    # When True, live hedge LOGS the order it would place but does NOT send it.
+    # Flip to False (HEDGE_DRY_RUN=0) only after a funded smoke test.
+    dry_run: bool = True
+
+
+class HedgeManager:
+    """Tracks a virtual (paper) or real (live) short futures position per token.
+
+    Invariant: short_qty[token] mirrors spot_long_qty[token].
+    PnL on short = (entry_avg - current_mark) * qty   (positive when price falls)
+    """
+    def __init__(self, hub, ex_by_id, config: HedgeConfig, mode_is_live: bool = False,
+                 futures_client=None):
+        self.hub = hub
+        self.ex_by_id = ex_by_id
+        self.cfg = config
+        self.live = mode_is_live
+        self.futures = futures_client          # ccxt async swap exchange (live only)
+        self.perp_symbol: dict[str, str] = {}  # token -> unified perp symbol, built in setup()
+        self._setup_done = False
+        self._lev_set: set[str] = set()        # perps we've already forced to 1x (lazy)
+        # token -> {"qty": float, "entry_avg": float, "opened_ts": float, "last_funding_ts": float}
+        self.shorts: dict = defaultdict(lambda: {"qty": 0.0, "entry_avg": 0.0,
+                                                 "opened_ts": 0.0, "last_funding_ts": 0.0})
+        self.realized_pnl_usd: float = 0.0      # closed shorts cumulative
+        self.funding_paid_usd: float = 0.0
+        # Tokens to leave UNHEDGED on purpose (env HEDGE_EXCLUDE="ULTIMA,FOO").
+        # adjust() returns early for these, so no short is ever opened/tracked for them.
+        self.exclude: set[str] = {
+            t.strip().upper() for t in os.getenv("HEDGE_EXCLUDE", "").split(",") if t.strip()
+        }
+        if self.exclude:
+            log.info(f"[HEDGE] excluded (will stay UNHEDGED): {sorted(self.exclude)}")
+        self._load_state()
+
+    async def setup(self, tokens=None):
+        """Load futures markets, map tokens to USDT-perp symbols, force 1x leverage
+        and one-way position mode. Safe to call once at startup. No-op without a
+        futures client (paper mode)."""
+        if self.futures is None or self._setup_done:
+            self._setup_done = True
+            return
+        try:
+            await self.futures.load_markets()
+        except Exception as e:
+            log.error(f"[HEDGE setup] futures load_markets failed: {e}")
+            return
+        # one-way mode removes positionSide ambiguity on open/close
+        try:
+            await self.futures.set_position_mode(False)
+        except Exception as e:
+            log.debug(f"[HEDGE setup] set_position_mode(one-way) skipped: {str(e)[:80]}")
+        for sym, m in self.futures.markets.items():
+            if m.get("swap") and m.get("quote") == "USDT" and m.get("settle") == "USDT":
+                base = m.get("base")
+                if base and (tokens is None or base in tokens):
+                    self.perp_symbol[base] = sym
+        # Leverage is forced to 1x lazily on first order per symbol (see _place) to
+        # avoid hammering the API with hundreds of set_leverage calls at startup.
+        self._setup_done = True
+        log.info(f"[HEDGE setup] live futures ready on {self.cfg.futures_exchange}: "
+                 f"{len(self.perp_symbol)} perps mapped, leverage={self.cfg.leverage}x (lazy), dry_run={self.cfg.dry_run}")
+
+    def can_hedge(self, token: str) -> bool:
+        return token in self.perp_symbol
+
+    async def _place(self, side: str, token: str, qty: float, reduce_only: bool):
+        """Send (or in dry_run, log) a futures market order. side='sell' opens/grows
+        the short; side='buy' (reduceOnly) closes it. 1x, one-way mode."""
+        sym = self.perp_symbol.get(token)
+        if not sym:
+            log.warning(f"[HEDGE LIVE] {token}: NO PERP — position is UNHEDGED")
+            return
+        try:
+            amt = float(self.futures.amount_to_precision(sym, qty))
+        except Exception:
+            amt = qty
+        if amt <= 0:
+            return
+        params = {"reduceOnly": True} if reduce_only else {}
+        if self.cfg.dry_run:
+            log.info(f"[HEDGE DRY-RUN] would {side} {amt} {sym} reduceOnly={reduce_only} (no order sent)")
+            return
+        # Force 1x leverage once per symbol, right before the first real order.
+        if sym not in self._lev_set:
+            try:
+                await self.futures.set_leverage(self.cfg.leverage, sym)
+            except Exception as e:
+                log.debug(f"[HEDGE] set_leverage 1x {sym} skipped: {str(e)[:80]}")
+            self._lev_set.add(sym)
+        order = await self.futures.create_order(sym, "market", side, amt, None, params)
+        log.info(f"[HEDGE LIVE] {side} {amt} {sym} reduceOnly={reduce_only} -> id={order.get('id')}")
+
+    def _load_state(self):
+        if not os.path.exists(self.cfg.state_path):
+            return
+        try:
+            with open(self.cfg.state_path) as f:
+                s = json.load(f)
+            for tok, v in (s.get("shorts") or {}).items():
+                self.shorts[tok] = v
+            self.realized_pnl_usd = s.get("realized_pnl_usd", 0.0)
+            self.funding_paid_usd = s.get("funding_paid_usd", 0.0)
+        except Exception:
+            pass
+
+    def _save_state(self):
+        try:
+            with open(self.cfg.state_path, "w") as f:
+                json.dump({
+                    "shorts": {t: v for t, v in self.shorts.items() if v["qty"] > 0},
+                    "realized_pnl_usd": self.realized_pnl_usd,
+                    "funding_paid_usd": self.funding_paid_usd,
+                }, f)
+        except Exception:
+            pass
+
+    # ---------- Called by Executor after both arb legs finalize ----------
+    async def adjust(self, token: str, new_spot_qty: float, mark_price: float):
+        """Sync short qty to match spot long qty. Grows or reduces the hedge and,
+        in live mode, places the matching futures order (1x, one-way)."""
+        if not self.cfg.enabled:
+            return
+        if token.upper() in self.exclude:
+            # Intentionally unhedged token — carry spot price risk, place no futures order.
+            return
+        if mark_price <= 0:
+            return
+        s = self.shorts[token]
+        delta = new_spot_qty - s["qty"]
+        if abs(delta * mark_price) < self.cfg.min_hedge_qty_usd:
+            return
+        now = time.time()
+        if delta > 0:
+            # Grow short — place the futures order FIRST; only update tracked state on success
+            if self.live:
+                try:
+                    await self._place("sell", token, delta, reduce_only=False)
+                except Exception as e:
+                    log.error(f"[HEDGE LIVE] open short {token} +{delta:.4f} FAILED: {e} — position UNDER-HEDGED")
+                    return
+            new_qty = s["qty"] + delta
+            s["entry_avg"] = (s["qty"] * s["entry_avg"] + delta * mark_price) / new_qty
+            s["qty"] = new_qty
+            if s["opened_ts"] == 0:
+                s["opened_ts"] = now
+                s["last_funding_ts"] = now
+            mode = "LIVE" if self.live else "PAPER"
+            log.info(f"[HEDGE {mode}] short {token} +{delta:.4f} @ {mark_price:.6g} | total_short={s['qty']:.4f} entry_avg={s['entry_avg']:.6g}")
+        else:
+            # Reduce short — close on the futures side first, then realize PnL in state
+            closed_qty = -delta
+            if self.live:
+                try:
+                    await self._place("buy", token, closed_qty, reduce_only=True)
+                except Exception as e:
+                    log.error(f"[HEDGE LIVE] close short {token} -{closed_qty:.4f} FAILED: {e} — short still OPEN")
+                    return
+            pnl = (s["entry_avg"] - mark_price) * closed_qty
+            self.realized_pnl_usd += pnl
+            s["qty"] += delta
+            mode = "LIVE" if self.live else "PAPER"
+            log.info(f"[HEDGE {mode}] close short {token} -{closed_qty:.4f} @ {mark_price:.6g} | pnl=${pnl:+.4f} | remaining={s['qty']:.4f}")
+            if s["qty"] <= 1e-9:
+                s["qty"] = 0.0
+                s["entry_avg"] = 0.0
+                s["opened_ts"] = 0.0
+        self._save_state()
+
+    # ---------- Funding accrual (called periodically by watcher) ----------
+    def accrue_funding(self):
+        """Accrue funding fee on all open shorts. Paper-sim: 0.01%/8h average."""
+        now = time.time()
+        for token, s in self.shorts.items():
+            if s["qty"] <= 0:
+                continue
+            hours_since = (now - s["last_funding_ts"]) / 3600
+            if hours_since < 8:
+                continue
+            # Mark via hub
+            mark = self._best_mark(token)
+            if mark <= 0:
+                continue
+            periods = int(hours_since / 8)
+            notional = s["qty"] * mark
+            fee = notional * self.cfg.funding_rate_8h * periods
+            self.funding_paid_usd += fee
+            s["last_funding_ts"] = now
+            log.debug(f"[HEDGE funding] {token} notional=${notional:.2f} fee=${fee:.4f} ({periods} periods)")
+        self._save_state()
+
+    def _best_mark(self, token: str) -> float:
+        best = 0.0
+        for ex_id, tickers in self.hub.tickers.items():
+            t = tickers.get(f"{token}/USDT")
+            if t:
+                mid = (t.get("bid", 0) + t.get("ask", 0)) / 2
+                if mid > best:
+                    best = mid
+        return best
+
+    # ---------- Mark-to-market PnL of all open shorts ----------
+    def unrealized_pnl_usd(self) -> float:
+        total = 0.0
+        for token, s in self.shorts.items():
+            if s["qty"] <= 0:
+                continue
+            mark = self._best_mark(token)
+            if mark <= 0:
+                continue
+            total += (s["entry_avg"] - mark) * s["qty"]
+        return total
+
+    def status_text(self) -> str:
+        n = sum(1 for s in self.shorts.values() if s["qty"] > 0)
+        return (f"hedge: open={n} realized=${self.realized_pnl_usd:+.2f} "
+                f"unreal=${self.unrealized_pnl_usd():+.2f} funding=${self.funding_paid_usd:.2f}")
+
+
+import asyncio
+
+
+async def hedge_watcher(hedge: HedgeManager, interval_sec: float = 60.0):
+    """Background loop: accrue funding periodically."""
+    log.info(f"hedge watcher started (interval={interval_sec}s, enabled={hedge.cfg.enabled})")
+    while True:
+        await asyncio.sleep(interval_sec)
+        try:
+            hedge.accrue_funding()
+        except Exception as e:
+            log.exception(f"hedge watcher error: {e}")

@@ -1,0 +1,11 @@
+# Cloudflare NAMED tunnel — app.eyecryptbot.com → локальный дашборд (Mini App).
+
+tunnel: ac50b50d-48eb-40fb-8485-8ba7708bf2c3
+credentials-file: C:\Users\danil\.cloudflared\ac50b50d-48eb-40fb-8485-8ba7708bf2c3.json
+
+ingress:
+  - hostname: app.eyecryptbot.com
+    service: http://localhost:8765
+  - hostname: api.eyecryptbot.com
+    service: http://localhost:8000
+  - service: http_status:404

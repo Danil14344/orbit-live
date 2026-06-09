@@ -1,0 +1,52 @@
+# ---- secrets ----
+.env
+.env.bak
+.env.prewipe.bak
+api.txt
+
+# ---- python ----
+__pycache__/
+*.pyc
+.venv/
+build/
+dist/
+*.spec
+
+# ---- large binaries / media ----
+*.rar
+*.zip
+*.exe
+*.blend
+*.blend1
+*.glb
+*.png
+*.ico
+three.min.js
+
+# ---- runtime state / data (machine-specific, not source) ----
+*.db
+*.jsonl
+*_state.json
+balances_snapshot.json
+virtual_portfolio.json
+scanner_heartbeat.txt
+scout_alerted.txt
+.last_sync_ts
+pair_scores_report.txt
+
+# ---- logs / backups ----
+logs/
+state_backups/
+paper_archive/
+*.log
+monitor_status.log
+
+# ---- agent temp ----
+_*.py
+
+# ---- separate web project (own repo, huge: node_modules/.next) ----
+eyecrypt/
+eyecrypt-bot.zip
+
+# ---- local editor/agent settings ----
+.claude/settings.local.json

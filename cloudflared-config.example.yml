@@ -1,0 +1,18 @@
+# Cloudflare NAMED tunnel — постоянный адрес на вашем домене для Mini App.
+#
+# Как получить значения ниже (делается один раз):
+#   1) cloudflared.exe tunnel login          # вход в аккаунт Cloudflare (откроется браузер)
+#   2) cloudflared.exe tunnel create eyecrypt # создаст туннель и файл <UUID>.json с ключами
+#   3) cloudflared.exe tunnel route dns eyecrypt app.ВАШ-ДОМЕН.com   # привяжет поддомен
+#   4) скопируйте этот файл в cloudflared-config.yml и подставьте значения
+#
+# После этого watchdog сам запустит туннель, а в .env поставьте:
+#   TELEGRAM_MINIAPP_URL=https://app.ВАШ-ДОМЕН.com
+
+tunnel: <UUID-туннеля-из-шага-2>
+credentials-file: C:\Users\danil\.cloudflared\<UUID-туннеля>.json
+
+ingress:
+  - hostname: app.ВАШ-ДОМЕН.com
+    service: http://localhost:8765
+  - service: http_status:404

@@ -1,0 +1,22 @@
+[Unit]
+Description=Orbit arbitrage bot (watchdog supervises scanner + dashboard)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust User and paths if you deploy somewhere other than /home/orbit/orbit
+User=orbit
+WorkingDirectory=/home/orbit/orbit
+# .env is loaded by ws_scanner.py via python-dotenv (cwd = WorkingDirectory)
+ExecStart=/home/orbit/orbit/.venv/bin/python /home/orbit/orbit/watchdog.py
+Restart=always
+RestartSec=10
+# watchdog handles its own child shutdown on SIGTERM
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
