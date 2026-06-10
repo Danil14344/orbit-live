@@ -103,7 +103,8 @@ def analyze_paper(path, lookback_h, min_windows, window_gap_sec=600):
     return out
 
 
-def analyze_shadow(path, lookback_h, min_windows, min_net_pct=0.0, window_gap_sec=600):
+def analyze_shadow(path, lookback_h, min_windows, min_net_pct=0.0, window_gap_sec=600,
+                   max_net_pct=5.0):
     """Like analyze_paper but reads the LIVE instance's own shadow opportunity log
     (tier1_shadow.jsonl / shadow_opps.jsonl) — every detected window on the live
     route, not just executed trades. Use on the VPS where there's no paper sibling.
@@ -150,6 +151,13 @@ def analyze_shadow(path, lookback_h, min_windows, min_net_pct=0.0, window_gap_se
         nets = [x[1] for x in rows]
         med_net = statistics.median(nets) if nets else 0.0
         pnl = sum(x[2] for x in rows)
+        # Sanity gate: a median "spread" this wide isn't arb — it's a venue where
+        # deposits/withdrawals are suspended or the token is being delisted
+        # (e.g. BTW showed median 35% net). Never seed these.
+        if med_net > max_net_pct:
+            log.warning(f"[REBAL] skip {tok}: median net {med_net:.1f}% > {max_net_pct:.1f}% — "
+                        f"suspicious (likely suspended transfers/delisting)")
+            continue
         # gate: enough windows AND median net currently clears the live threshold
         if windows >= min_windows and med_net >= min_net_pct:
             out.append((tok, {"windows": windows, "trades": len(rows), "pnl": pnl,
@@ -169,7 +177,9 @@ def _ranked_candidates(lookback_h, min_windows):
         # require median window net >= live trade threshold so we don't seed a token
         # whose spread already compressed below what the executor will trade.
         min_net = float(os.getenv("REBALANCE_MIN_NET_PCT", os.getenv("MIN_NET_PCT", "0.3")))
-        return analyze_shadow(shadow_path, lookback_h, min_windows, min_net_pct=min_net)
+        max_net = float(os.getenv("REBALANCE_MAX_NET_PCT", "5.0"))
+        return analyze_shadow(shadow_path, lookback_h, min_windows, min_net_pct=min_net,
+                              max_net_pct=max_net)
     return analyze_paper(_paper_trades_path(), lookback_h, min_windows)
 
 
@@ -309,9 +319,13 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
 
     # liquidity-filter candidates until we have cap_tokens
     target = []
+    from executor import BANNED_TOKENS
     for tok, stats in ranked:
         if len(target) >= cap_tokens:
             break
+        if tok in BANNED_TOKENS:
+            log.info(f"[REBAL] skip {tok}: banned")
+            continue
         sym = f"{tok}/USDT"
         ok_all = True
         for exid in LIVE_ROUTE:

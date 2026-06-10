@@ -27,7 +27,11 @@ from typing import Optional
 
 
 # Tokens banned from trading — consistently trigger stop-losses due to thin liquidity
-BANNED_TOKENS = set()
+# Hard ban list — tokens that look like arb but aren't tradeable end-to-end
+# (suspended deposits/withdrawals, delistings). Env: BANNED_TOKENS=BTW,XXX
+BANNED_TOKENS = {
+    t.strip().upper() for t in os.getenv("BANNED_TOKENS", "").split(",") if t.strip()
+}
 
 # Whitelist mode — if non-empty, ONLY these tokens are traded. Others are logged
 # to shadow_opps.jsonl as "would have traded" for later analysis (swap candidates).
@@ -864,14 +868,25 @@ class Executor:
                 self.guard.on_fill(opp["buy_ex"], token, "buy", filled, buy_price)
             try:
                 if filled > 0:
-                    log.warning(f"[HEDGE] sell failed — closing buy leg: market_sell {sym}@{opp['buy_ex']} qty={filled:.4f}")
+                    # Fee may be taken in base currency, so free balance can be
+                    # slightly below `filled` — selling `filled` then fails with
+                    # "balance not enough". Cap at the actual free amount.
+                    close_qty = filled
+                    try:
+                        bal = await asyncio.wait_for(ex_buy.fetch_balance(), timeout=10)
+                        avail = float((bal.get(token) or {}).get("free") or 0)
+                        if 0 < avail < close_qty:
+                            close_qty = avail
+                    except Exception:
+                        pass
+                    log.warning(f"[HEDGE] sell failed — closing buy leg: market_sell {sym}@{opp['buy_ex']} qty={close_qty:.4f}")
                     close_res = await asyncio.wait_for(
-                        ex_buy.create_market_sell_order(sym, filled),
+                        ex_buy.create_market_sell_order(sym, close_qty),
                         timeout=self.cfg.order_timeout_sec,
                     )
                     if self.guard is not None:
                         self.guard.on_fill(opp["buy_ex"], token, "sell",
-                                           _fill_qty(close_res) or filled,
+                                           _fill_qty(close_res) or close_qty,
                                            _fill_price(close_res, buy_price))
                     rec.status = "hedged_sell_failed"
                 else:
