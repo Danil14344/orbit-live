@@ -27,7 +27,7 @@ except Exception:
 
 from appdir import BASE_DIR
 ROOT = BASE_DIR
-VERSION = "1.0.4"   # bumped on each release; auto-update compares this
+VERSION = "1.0.5"   # bumped on each release; auto-update compares this
 DEFAULT_BACKEND = "https://api.eyecryptbot.com"
 
 app = FastAPI()
