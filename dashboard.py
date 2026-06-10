@@ -27,7 +27,7 @@ except Exception:
 
 from appdir import BASE_DIR
 ROOT = BASE_DIR
-VERSION = "1.0.3"   # bumped on each release; auto-update compares this
+VERSION = "1.0.4"   # bumped on each release; auto-update compares this
 DEFAULT_BACKEND = "https://api.eyecryptbot.com"
 
 app = FastAPI()
@@ -188,6 +188,27 @@ def _scanner_alive() -> bool:
         return False
 
 
+def _os_lang() -> str:
+    """System UI language as a 2-letter code, so the desktop app opens in the user's
+    language by default (the embedded webview reports 'en' regardless of OS locale)."""
+    code = ""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            lcid = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+            buf = ctypes.create_unicode_buffer(85)
+            # LOCALE_SISO639LANGNAME = 0x59 → ISO 639 language name, e.g. "ru"
+            if ctypes.windll.kernel32.GetLocaleInfoW(lcid, 0x59, buf, 85):
+                code = buf.value
+        if not code:
+            import locale
+            code = (locale.getdefaultlocale()[0] or "")[:2]
+    except Exception:
+        code = ""
+    code = (code or "en").lower()[:2]
+    return code if code in ("en", "ru", "es", "zh") else "en"
+
+
 @app.get("/api/status")
 def api_status():
     env = _read_env()
@@ -198,6 +219,7 @@ def api_status():
         "has_license": bool(env.get("EYECRYPT_LICENSE")),
         "backend": env.get("EYECRYPT_API", DEFAULT_BACKEND),
         "paused": env.get("PAUSED", "0") == "1",
+        "default_lang": _os_lang(),
         "ts": time.time(),
     }
 
@@ -209,6 +231,36 @@ def api_balances():
     if not snap:
         return {"empty": True}
     return snap
+
+
+@app.get("/api/license-info")
+def api_license_info():
+    """Subscription/tier info for the Cabinet tab — verifies the local license against
+    the backend. Returns tier number, validity and expiry without exposing the key."""
+    env = _read_env()
+    lic = env.get("EYECRYPT_LICENSE", "").strip()
+    backend = env.get("EYECRYPT_API", DEFAULT_BACKEND)
+    placeholders = {"", "paste-your-license-here", "paste-your-license",
+                    "your-license-here", "your-license", "changeme"}
+    if lic in placeholders:
+        return {"has_license": False, "valid": False, "tier": 0}
+    try:
+        import httpx
+        hdr = {"Authorization": f"Bearer {lic}"}
+        try:
+            from license import _device_id
+            hdr["X-Device-Id"] = _device_id()
+        except Exception:
+            pass
+        r = httpx.get(f"{backend}/v1/verify", headers=hdr, timeout=8)
+        if r.status_code != 200:
+            return {"has_license": True, "valid": False, "tier": 0,
+                    "error": r.text[:160]}
+        d = r.json()
+        return {"has_license": True, "valid": bool(d.get("valid")),
+                "tier": int(d.get("tier") or 0), "expires_at": d.get("expires_at")}
+    except Exception as e:
+        return {"has_license": True, "valid": None, "tier": 0, "error": str(e)[:160]}
 
 
 @app.get("/api/version-check")
@@ -282,7 +334,8 @@ def update_settings(s: SettingsUpdate):
 
 # ────────────────────────────── API: exchange keys ──────────────────────────────
 
-EXCHANGES = ["mexc", "kucoin", "bitget", "htx", "bingx", "bitmart"]
+# HTX (Huobi) removed — under sanctions, no longer a supported venue.
+EXCHANGES = ["mexc", "kucoin", "bitget", "bingx", "bitmart"]
 
 
 class ApiKeyUpdate(BaseModel):
@@ -304,7 +357,7 @@ def get_exchange_keys():
             "exchange": ex,
             "configured": bool(k and s),
             "key_preview": (k[:6] + "…" + k[-4:]) if len(k) > 10 else "",
-            "needs_passphrase": ex in ("kucoin", "bitget", "bitmart", "htx"),
+            "needs_passphrase": ex in ("kucoin", "bitget", "bitmart"),
         })
     return out
 
@@ -777,6 +830,8 @@ td.tag { color: var(--text-dim); font-family: 'JetBrains Mono'; font-size: 11px;
 .btn-sec:hover { background: rgba(139,92,246,0.18); box-shadow: inset 0 0 0 1px var(--card-border-hov); }
 .btn-danger { background: linear-gradient(135deg, #ef4444, #f87171); box-shadow: 0 8px 24px -8px rgba(239,68,68,0.5); }
 .btn-sm { padding: 6px 12px; font-size: 12px; }
+/* Enlarged pause/resume control — easier to hit, more prominent. */
+.pause-big { padding: 11px 24px; font-size: 15px; font-weight: 700; border-radius: 12px; }
 
 .field {
   width: 100%; padding: 10px 12px; border-radius: 9px;
@@ -855,7 +910,7 @@ td.tag { color: var(--text-dim); font-family: 'JetBrains Mono'; font-size: 11px;
       <span class="status-pill"><span id="status-dot" class="dot off"></span><span id="status-text">…</span></span>
       <span class="status-pill"><span class="mono" style="color:var(--violet-2);">MODE</span> <span id="status-mode">—</span></span>
       <span class="status-pill"><span class="mono" style="color:var(--violet-2);">LIC</span> <span id="status-lic">—</span></span>
-      <button id="pause-btn" class="btn btn-sec btn-sm" onclick="togglePause()" data-i18n="pause">⏸ Pause</button>
+      <button id="pause-btn" class="btn btn-sec pause-big" onclick="togglePause()" data-i18n="pause">⏸ Pause</button>
     </div>
   </div>
 
@@ -875,6 +930,7 @@ td.tag { color: var(--text-dim); font-family: 'JetBrains Mono'; font-size: 11px;
   <div class="tabs">
     <button class="tab-btn active" data-tab="dash" data-i18n="tabDash">Dashboard</button>
     <button class="tab-btn" data-tab="trades" data-i18n="tabTrades">Trades</button>
+    <button class="tab-btn" data-tab="cabinet" data-i18n="tabCabinet">Cabinet</button>
     <button class="tab-btn" data-tab="settings" data-i18n="tabSettings">Settings</button>
     <button class="tab-btn" data-tab="keys" data-i18n="tabKeys">API Keys</button>
   </div>
@@ -892,6 +948,40 @@ td.tag { color: var(--text-dim); font-family: 'JetBrains Mono'; font-size: 11px;
     </div>
   </div>
 
+  <!-- Cabinet pane -->
+  <div id="pane-cabinet" class="tab-pane">
+    <div class="card" style="max-width:680px;">
+      <h2 data-i18n="cabSubscription">Subscription</h2>
+      <div id="cab-sub" style="margin-top:6px;">
+        <div class="metric grad" id="cab-tier">—</div>
+        <div class="sub" id="cab-sub-info" data-i18n="cabLoading">Loading…</div>
+      </div>
+      <a href="https://eyecryptbot.com/pricing" target="_blank" class="btn btn-sec btn-sm" style="margin-top:14px;" data-i18n="cabUpgrade">Upgrade / Renew</a>
+    </div>
+
+    <div class="card" style="max-width:680px; margin-top:16px;">
+      <h2 data-i18n="cabLicense">License</h2>
+      <p class="sub" style="margin:-4px 0 14px;">
+        <span data-i18n="licenseFrom">From</span> <a href="https://eyecryptbot.com/cabinet" target="_blank" style="color:var(--fuchsia-2);">eyecryptbot.com/cabinet</a>
+      </p>
+      <div class="field-group">
+        <label class="label" data-i18n="licenseKey">License key</label>
+        <input id="c-license" class="field mono" type="password" data-i18n-attr="placeholder:licensePh" placeholder="paste JWT from your cabinet"/>
+      </div>
+      <button class="btn" onclick="saveLicense()" data-i18n="cabSaveLicense">Save license</button>
+    </div>
+
+    <div class="card" style="max-width:680px; margin-top:16px;">
+      <h2 data-i18n="cabLanguage">Language</h2>
+      <select id="cab-lang" class="field" style="max-width:240px; margin-top:6px;">
+        <option value="en">🇬🇧 English</option>
+        <option value="ru">🇷🇺 Русский</option>
+        <option value="es">🇪🇸 Español</option>
+        <option value="zh">🇨🇳 中文</option>
+      </select>
+    </div>
+  </div>
+
   <!-- Settings pane -->
   <div id="pane-settings" class="tab-pane">
     <div class="card" style="max-width:680px;">
@@ -899,14 +989,7 @@ td.tag { color: var(--text-dim); font-family: 'JetBrains Mono'; font-size: 11px;
       <p class="sub" style="margin:-4px 0 18px;" data-i18n="configHelp">Changes save to local .env. Restart bot to apply.</p>
 
       <div class="settings-section">
-        <h3 class="gradient-text" data-i18n="secLicense">License & connection</h3>
-        <div class="field-group">
-          <label class="label" data-i18n="licenseKey">License key</label>
-          <input id="s-license" class="field mono" type="password" data-i18n-attr="placeholder:licensePh" placeholder="paste JWT from your cabinet"/>
-          <div class="sub" style="margin-top:4px;">
-            <span data-i18n="licenseFrom">From</span> <a href="https://eyecryptbot.com/cabinet" target="_blank" style="color:var(--fuchsia-2);">eyecryptbot.com/cabinet</a>
-          </div>
-        </div>
+        <h3 class="gradient-text" data-i18n="secConnection">Connection</h3>
         <div class="field-group">
           <label class="label" data-i18n="backendUrl">Backend URL</label>
           <input id="s-backend" class="field mono" type="text" placeholder="https://api.eyecryptbot.com"/>
@@ -943,6 +1026,10 @@ td.tag { color: var(--text-dim); font-family: 'JetBrains Mono'; font-size: 11px;
 
   <!-- API Keys pane -->
   <div id="pane-keys" class="tab-pane">
+    <div class="card" style="max-width:680px; margin-bottom:16px;">
+      <h2 data-i18n="balancesTitle">Exchange balances (USDT)</h2>
+      <div id="keys-balances"><div class="sub" data-i18n="balUnavail">No balances yet — set API keys below.</div></div>
+    </div>
     <div class="card" style="max-width:680px;">
       <h2 data-i18n="exchangeKeys">Exchange API keys</h2>
       <p class="sub" style="margin:-4px 0 18px;" data-i18n-html="keysHelp">
@@ -961,7 +1048,7 @@ td.tag { color: var(--text-dim); font-family: 'JetBrains Mono'; font-size: 11px;
 // ─────────────── i18n ───────────────
 const I18N = {
   en: {
-    online:"ONLINE", offline:"OFFLINE", pause:"⏸ Pause", resume:"▶ Resume",
+    online:"ONLINE", offline:"OFFLINE", pausedStatus:"PAUSED", pause:"⏸ Pause", resume:"▶ Resume",
     updateAvailable:"🚀 Update available", later:"Later", updateNow:"Update now",
     tabDash:"Dashboard", tabTrades:"Trades", tabSettings:"Settings", tabKeys:"API Keys",
     pnlLive:"PnL (live run)", trades:"Trades", rate:"Rate", avgTrade:"Avg trade",
@@ -991,9 +1078,20 @@ const I18N = {
     toastNoUrl:"No download URL", toastUpdateFail:"Update failed",
     confirmRestart:"Restart bot? Takes ~60 seconds.",
     confirmUpdate:"Update to v{v}?\n\nThe app will close and restart.",
+    tabCabinet:"Cabinet", secConnection:"Connection",
+    cabSubscription:"Subscription", cabLoading:"Loading…", cabUpgrade:"Upgrade / Renew",
+    cabLicense:"License", cabSaveLicense:"Save license", cabLanguage:"Language",
+    cabActive:"Active", cabExpired:"Expired — renew to keep trading",
+    cabNoLicense:"No license — paper (simulation) only", cabInvalid:"License invalid or server unreachable",
+    cabExpires:"Expires", cabDaysLeft:"days left",
+    tierFree:"Free / Paper", tierScanner:"Scanner", tierLite:"Lite", tierPro:"Pro",
+    balancesTitle:"Exchange balances (USDT)",
+    balUnavail:"No balances yet — add API keys below (works in paper mode too).",
+    balTotal:"Total (all exchanges)",
+    toastLicenseSaved:"License saved — bot restarting to apply",
   },
   ru: {
-    online:"ОНЛАЙН", offline:"ОФФЛАЙН", pause:"⏸ Пауза", resume:"▶ Запустить",
+    online:"ОНЛАЙН", offline:"ОФФЛАЙН", pausedStatus:"ПАУЗА", pause:"⏸ Пауза", resume:"▶ Запустить",
     updateAvailable:"🚀 Доступно обновление", later:"Позже", updateNow:"Обновить",
     tabDash:"Дашборд", tabTrades:"Сделки", tabSettings:"Настройки", tabKeys:"API ключи",
     pnlLive:"PnL (текущий запуск)", trades:"Сделок", rate:"Темп", avgTrade:"Средняя сделка",
@@ -1023,9 +1121,20 @@ const I18N = {
     toastNoUrl:"Нет URL загрузки", toastUpdateFail:"Ошибка обновления",
     confirmRestart:"Перезапустить бота? Займёт ~60 секунд.",
     confirmUpdate:"Обновить до v{v}?\n\nПриложение закроется и перезапустится.",
+    tabCabinet:"Кабинет", secConnection:"Подключение",
+    cabSubscription:"Подписка", cabLoading:"Загрузка…", cabUpgrade:"Продлить / Улучшить",
+    cabLicense:"Лицензия", cabSaveLicense:"Сохранить лицензию", cabLanguage:"Язык",
+    cabActive:"Активна", cabExpired:"Истекла — продлите чтобы торговать",
+    cabNoLicense:"Нет лицензии — только paper (симуляция)", cabInvalid:"Лицензия недействительна или сервер недоступен",
+    cabExpires:"Истекает", cabDaysLeft:"дней осталось",
+    tierFree:"Free / Paper", tierScanner:"Сканер", tierLite:"Лайт", tierPro:"Про",
+    balancesTitle:"Балансы бирж (USDT)",
+    balUnavail:"Балансов пока нет — добавьте API ключи ниже (работает и в paper).",
+    balTotal:"Итого (все биржи)",
+    toastLicenseSaved:"Лицензия сохранена — бот перезапускается",
   },
   es: {
-    online:"EN LÍNEA", offline:"OFFLINE", pause:"⏸ Pausar", resume:"▶ Reanudar",
+    online:"EN LÍNEA", offline:"OFFLINE", pausedStatus:"PAUSA", pause:"⏸ Pausar", resume:"▶ Reanudar",
     updateAvailable:"🚀 Actualización disponible", later:"Más tarde", updateNow:"Actualizar",
     tabDash:"Panel", tabTrades:"Trades", tabSettings:"Ajustes", tabKeys:"Claves API",
     pnlLive:"PnL (ejecución actual)", trades:"Trades", rate:"Tasa", avgTrade:"Trade medio",
@@ -1055,9 +1164,20 @@ const I18N = {
     toastNoUrl:"Sin URL de descarga", toastUpdateFail:"Error de actualización",
     confirmRestart:"¿Reiniciar el bot? Tarda ~60 segundos.",
     confirmUpdate:"¿Actualizar a v{v}?\n\nLa app se cerrará y reiniciará.",
+    tabCabinet:"Panel", secConnection:"Conexión",
+    cabSubscription:"Suscripción", cabLoading:"Cargando…", cabUpgrade:"Mejorar / Renovar",
+    cabLicense:"Licencia", cabSaveLicense:"Guardar licencia", cabLanguage:"Idioma",
+    cabActive:"Activa", cabExpired:"Expirada — renueva para seguir operando",
+    cabNoLicense:"Sin licencia — solo paper (simulación)", cabInvalid:"Licencia inválida o servidor inalcanzable",
+    cabExpires:"Expira", cabDaysLeft:"días restantes",
+    tierFree:"Free / Paper", tierScanner:"Scanner", tierLite:"Lite", tierPro:"Pro",
+    balancesTitle:"Balances de exchange (USDT)",
+    balUnavail:"Sin balances aún — añade claves API abajo (también en paper).",
+    balTotal:"Total (todos los exchanges)",
+    toastLicenseSaved:"Licencia guardada — el bot se reinicia",
   },
   zh: {
-    online:"在线", offline:"离线", pause:"⏸ 暂停", resume:"▶ 恢复",
+    online:"在线", offline:"离线", pausedStatus:"暂停", pause:"⏸ 暂停", resume:"▶ 恢复",
     updateAvailable:"🚀 有可用更新", later:"稍后", updateNow:"立即更新",
     tabDash:"仪表盘", tabTrades:"交易", tabSettings:"设置", tabKeys:"API 密钥",
     pnlLive:"PnL（当前运行）", trades:"交易数", rate:"频率", avgTrade:"平均交易",
@@ -1087,9 +1207,21 @@ const I18N = {
     toastNoUrl:"无下载 URL", toastUpdateFail:"更新失败",
     confirmRestart:"重启机器人？需要约 60 秒。",
     confirmUpdate:"更新到 v{v}？\n\n应用将关闭并重启。",
+    tabCabinet:"个人中心", secConnection:"连接",
+    cabSubscription:"订阅", cabLoading:"加载中…", cabUpgrade:"升级 / 续费",
+    cabLicense:"许可证", cabSaveLicense:"保存许可证", cabLanguage:"语言",
+    cabActive:"有效", cabExpired:"已过期 — 续费以继续交易",
+    cabNoLicense:"无许可证 — 仅模拟交易", cabInvalid:"许可证无效或服务器不可达",
+    cabExpires:"到期", cabDaysLeft:"天剩余",
+    tierFree:"免费 / 模拟", tierScanner:"扫描器", tierLite:"轻量版", tierPro:"专业版",
+    balancesTitle:"交易所余额 (USDT)",
+    balUnavail:"暂无余额 — 在下方添加 API 密钥（模拟模式也可）。",
+    balTotal:"总计（所有交易所）",
+    toastLicenseSaved:"许可证已保存 — 机器人正在重启",
   },
 };
-let LANG = localStorage.getItem("ec_lang") || (navigator.language || "en").slice(0,2);
+let _savedLang = localStorage.getItem("ec_lang");
+let LANG = _savedLang || (navigator.language || "en").slice(0,2);
 if (!I18N[LANG]) LANG = "en";
 const t = (k, vars) => {
   let s = (I18N[LANG] && I18N[LANG][k]) || I18N.en[k] || k;
@@ -1116,7 +1248,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const sw = document.getElementById('lang-sw');
   if (sw) {
     sw.value = LANG;
-    sw.onchange = e => { LANG = e.target.value; localStorage.setItem("ec_lang", LANG); applyI18n(); loadDash(); };
+    sw.onchange = e => setLang(e.target.value);
   }
   applyI18n();
 });
@@ -1133,6 +1265,7 @@ for (const b of document.querySelectorAll('.tab-btn')) {
     for (const p of document.querySelectorAll('.tab-pane')) p.classList.toggle('active', p.id === 'pane-' + b.dataset.tab);
     if (b.dataset.tab === 'settings') loadSettings();
     if (b.dataset.tab === 'keys') loadKeys();
+    if (b.dataset.tab === 'cabinet') loadCabinet();
   };
 }
 
@@ -1146,14 +1279,27 @@ function toast(msg, err=false) {
 }
 
 // ─────────────── status & version ───────────────
+// Debounce offline flicker: the scanner heartbeat can briefly lag during a busy scan
+// or a restart. Require 2 consecutive offline reads before flipping the pill to OFFLINE
+// so a single late heartbeat doesn't make the status jump online↔offline.
+let _offlineStreak = 0;
 async function loadStatus() {
   try {
     const r = await fetch('/api/status');
     const s = await r.json();
+    // First run with no saved choice: adopt the OS language (the webview itself reports
+    // 'en', so without this the app always opened in English). Honours an explicit pick.
+    if (!_savedLang && s.default_lang && I18N[s.default_lang] && s.default_lang !== LANG) {
+      _savedLang = "_auto";   // adopt once, don't fight a later manual change
+      setLang(s.default_lang);
+    }
     document.getElementById('ver').textContent = s.version;
     const dot = document.getElementById('status-dot');
     const txt = document.getElementById('status-text');
-    if (s.scanner_alive) { dot.className = 'dot live'; txt.textContent = t('online'); }
+    if (s.scanner_alive) _offlineStreak = 0; else _offlineStreak++;
+    const showOffline = _offlineStreak >= 2;
+    if (s.paused && s.scanner_alive) { dot.className = 'dot paused'; txt.textContent = t('pausedStatus'); }
+    else if (!showOffline) { dot.className = 'dot live'; txt.textContent = t('online'); }
     else { dot.className = 'dot off'; txt.textContent = t('offline'); }
     document.getElementById('status-mode').textContent = (s.mode || 'paper').toUpperCase();
     document.getElementById('status-lic').textContent = s.has_license ? '✓' : '—';
@@ -1298,7 +1444,6 @@ async function loadDash() {
 async function loadSettings() {
   try {
     const s = await (await fetch('/api/settings')).json();
-    document.getElementById('s-license').value = s.license_key || '';
     document.getElementById('s-mode').value = s.mode || 'paper';
     document.getElementById('s-pos').value = s.position_usd;
     document.getElementById('s-net').value = s.min_net_pct;
@@ -1307,7 +1452,6 @@ async function loadSettings() {
 }
 async function saveSettings() {
   const body = {
-    license_key: document.getElementById('s-license').value,
     mode: document.getElementById('s-mode').value,
     position_usd: parseFloat(document.getElementById('s-pos').value),
     min_net_pct: parseFloat(document.getElementById('s-net').value),
@@ -1318,6 +1462,64 @@ async function saveSettings() {
     const j = await r.json();
     if (!r.ok) return toast(j.error || t('toastFailed'), true);
     toast(t('toastSaved'));
+    loadStatus();
+  } catch (e) { toast(e.message, true); }
+}
+
+// ─────────────── cabinet (subscription + license + language) ───────────────
+const TIER_KEYS = { 0:'tierFree', 1:'tierScanner', 2:'tierLite', 3:'tierPro' };
+async function loadCabinet() {
+  // license key field
+  try {
+    const s = await (await fetch('/api/settings')).json();
+    const lf = document.getElementById('c-license');
+    if (lf) lf.value = s.license_key || '';
+  } catch (e) {}
+  // language selector reflects current LANG
+  const ls = document.getElementById('cab-lang');
+  if (ls) { ls.value = LANG; ls.onchange = e => { setLang(e.target.value); }; }
+  // subscription info
+  const tierEl = document.getElementById('cab-tier');
+  const infoEl = document.getElementById('cab-sub-info');
+  tierEl.textContent = '…'; infoEl.textContent = t('cabLoading');
+  try {
+    const d = await (await fetch('/api/license-info')).json();
+    const tierName = t(TIER_KEYS[d.tier] || 'tierFree');
+    tierEl.textContent = tierName;
+    if (!d.has_license) { infoEl.textContent = t('cabNoLicense'); return; }
+    if (d.valid === false || d.valid === null) {
+      infoEl.textContent = d.error ? (t('cabInvalid')) : t('cabExpired');
+      return;
+    }
+    let line = t('cabActive');
+    if (d.expires_at) {
+      const exp = new Date(d.expires_at);
+      if (!isNaN(exp)) {
+        const days = Math.max(0, Math.ceil((exp - Date.now()) / 86400000));
+        line += ' · ' + t('cabExpires') + ' ' + exp.toLocaleDateString() + ' · ' + days + ' ' + t('cabDaysLeft');
+      }
+    }
+    infoEl.textContent = line;
+  } catch (e) { infoEl.textContent = t('cabInvalid'); }
+}
+function setLang(l) {
+  LANG = l; localStorage.setItem('ec_lang', l);
+  const sw = document.getElementById('lang-sw'); if (sw) sw.value = l;
+  const cs = document.getElementById('cab-lang'); if (cs) cs.value = l;
+  applyI18n(); loadDash(); loadStatus();
+  const cab = document.getElementById('pane-cabinet');
+  if (cab && cab.classList.contains('active')) loadCabinet();
+  const keys = document.getElementById('pane-keys');
+  if (keys && keys.classList.contains('active')) loadBalances();
+}
+async function saveLicense() {
+  const key = document.getElementById('c-license').value.trim();
+  try {
+    const r = await fetch('/api/settings', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ license_key: key }) });
+    const j = await r.json();
+    if (!r.ok) return toast(j.error || t('toastFailed'), true);
+    toast(t('toastLicenseSaved'));
+    setTimeout(loadCabinet, 800);
     loadStatus();
   } catch (e) { toast(e.message, true); }
 }
@@ -1336,8 +1538,37 @@ async function togglePause() {
   } catch (e) { toast(e.message, true); }
 }
 
+// ─────────────── exchange balances (shown in API-keys tab) ───────────────
+async function loadBalances() {
+  const el = document.getElementById('keys-balances');
+  if (!el) return;
+  try {
+    const ba = await (await fetch('/api/balances')).json();
+    if (!ba || ba.empty || !ba.exchanges || !Object.keys(ba.exchanges).length) {
+      el.innerHTML = `<div class="sub">${t('balUnavail')}</div>`;
+      return;
+    }
+    let rows = '';
+    for (const [ex, d] of Object.entries(ba.exchanges)) {
+      const val = (d.value_usd != null) ? d.value_usd : (d.usdt || 0);
+      const err = d.error ? `<span class="neg" style="font-size:11px;"> ${d.error}</span>` : '';
+      rows += `<div class="bar-row" style="justify-content:space-between;">
+        <span style="text-transform:capitalize; font-weight:600;">${ex}${err}</span>
+        <span class="mono">${dollar(val)}</span></div>`;
+    }
+    const tot = (ba.spot_value_total != null) ? ba.spot_value_total : (ba.usdt_total || 0);
+    rows += `<div class="bar-row" style="justify-content:space-between; border-top:1px solid var(--card-border); margin-top:6px; padding-top:10px;">
+      <span class="gradient-text" style="font-weight:700;">${t('balTotal')}</span>
+      <span class="mono gradient-text" style="font-weight:700;">${dollar(tot)}</span></div>`;
+    el.innerHTML = rows;
+  } catch (e) {
+    el.innerHTML = `<div class="sub">${t('balUnavail')}</div>`;
+  }
+}
+
 // ─────────────── exchange keys ───────────────
 async function loadKeys() {
+  loadBalances();
   try {
     const list = await (await fetch('/api/exchange-keys')).json();
     document.getElementById('keys-list').innerHTML = list.map(k => `

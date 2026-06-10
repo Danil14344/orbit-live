@@ -32,17 +32,18 @@ from bidir import BidirectionalTracker
 from ws_hotset import HotSetManager
 
 
-EXCHANGES = ["mexc", "bitget", "bingx"]  # funded live venues; bitget<->mexc is the money route (HOME). full list: mexc,kucoin,bitget,htx,bingx,bitmart
+EXCHANGES = ["mexc", "bitget", "bingx"]  # funded live venues; bitget<->mexc is the money route (HOME). full list: mexc,kucoin,bitget,bingx,bitmart
+# NOTE: HTX (Huobi) removed — under sanctions, no longer a supported venue.
 # WS strategy:
 #   "all"      = watchTickers() with no args, returns all symbols (kucoin)
 #   "list"     = watchTickers([symbols]) requires explicit list (bitget, bitmart)
-#   "rest"     = REST poll only (mexc, htx, bingx — spot watchTickers not supported)
+#   "rest"     = REST poll only (mexc, bingx — spot watchTickers not supported)
 # kucoin was "all" (persistent watch_tickers WS) but at ~1s RTT the socket keeps
 # dropping with "ping-pong keepalive missing" / close 1006. REST polling is
 # stateless and tolerant of latency, so kucoin now polls over REST like mexc/bingx.
 WS_MODE = {
     "bitget": "list", "bitmart": "list",
-    "mexc": "rest", "htx": "rest", "bingx": "rest", "kucoin": "rest",
+    "mexc": "rest", "bingx": "rest", "kucoin": "rest",
 }
 UNIVERSE_MIN_VOL = 200_000          # symbols to subscribe must exceed this on at least 1 ex
 UNIVERSE_MAX_SIZE = 300             # global cap
@@ -651,12 +652,78 @@ async def leg_risk_logger(executor, interval_sec=900):
             rl.warning(f"summary failed: {str(e)[:80]}")
 
 
+async def env_watch_loop(interval_sec: float = 3.0):
+    """Self-restart when .env settings change.
+
+    The dashboard writes license key / mode / API keys into .env. The scanner reads env
+    only at process start, so without this the user would have to manually restart for
+    changes to take effect ("after entering the license key nothing happens"). We compare
+    a signature of the relevant settings and exit on change — the watchdog respawns us
+    with the new env.
+
+    PAUSED is deliberately excluded: it's a dashboard display toggle the scanner doesn't
+    read at startup, so toggling pause must NOT trigger a (slow) restart.
+    """
+    env_path = BASE_DIR / ".env"
+
+    def _sig():
+        try:
+            out = {}
+            for line in env_path.read_text(encoding="utf-8").splitlines():
+                if "=" in line and not line.lstrip().startswith("#"):
+                    k, _, v = line.partition("=")
+                    k = k.strip()
+                    if k == "PAUSED":
+                        continue
+                    out[k] = v.strip()
+            return tuple(sorted(out.items()))
+        except Exception:
+            return None
+
+    last = _sig()
+    while True:
+        await asyncio.sleep(interval_sec)
+        cur = _sig()
+        if cur is None:
+            continue
+        if last is not None and cur != last:
+            log.info(".env settings changed — restarting scanner to apply")
+            console.print("[yellow].env changed — restarting to apply new settings…[/yellow]")
+            os._exit(3)   # watchdog respawns with the updated environment
+        last = cur
+
+
 async def main():
-    # Eye Crypt license check (disabled if EYECRYPT_LICENSE not set — local dev)
-    if os.getenv("EYECRYPT_LICENSE"):
-        from license import verify_or_exit
-        _tier = verify_or_exit()
-        console.print(f"[bold green]Eye Crypt license OK — tier {_tier}[/bold green]")
+    # Eye Crypt license check.
+    #   PAPER mode → soft check: never exits, so simulation always starts even with no /
+    #                placeholder / expired key (fixes the crash-loop where paper never ran).
+    #   LIVE  mode → hard check: a valid paid license is required to trade real money.
+    global EXEC_MODE
+    from license import verify_or_exit, is_placeholder_license
+    _lic = os.getenv("EYECRYPT_LICENSE", "")
+    if _lic == "":
+        # No license configured at all → operator / source run. No backend check — this
+        # is how the owner's own live bot runs (unchanged from before licensing existed).
+        console.print(f"[dim]No EYECRYPT_LICENSE set — running unlicensed ({EXEC_MODE.value.upper()})[/dim]")
+    elif is_placeholder_license(_lic):
+        # Fresh customer who hasn't pasted a real key yet. Never trade real money and never
+        # crash-loop: fall back to PAPER (simulation) until a key is entered in the cabinet.
+        if EXEC_MODE == Mode.LIVE:
+            console.print("[yellow]LIVE needs a license key — running PAPER until you set one in the cabinet[/yellow]")
+            EXEC_MODE = Mode.PAPER
+        else:
+            console.print("[yellow]No license set — PAPER (simulation) only[/yellow]")
+    else:
+        # Real key present: verify against backend. Soft check (never sys.exit) so an
+        # expired/invalid sub downgrades to PAPER instead of crash-looping the scanner.
+        _tier = verify_or_exit(hard=False)
+        if _tier:
+            console.print(f"[bold green]Eye Crypt license OK — tier {_tier}[/bold green]")
+        elif EXEC_MODE == Mode.LIVE:
+            console.print("[yellow]License invalid/expired — LIVE disabled, running PAPER[/yellow]")
+            EXEC_MODE = Mode.PAPER
+        else:
+            console.print("[yellow]No valid license — PAPER (simulation) only[/yellow]")
     console.print("[bold]Building exchanges (ccxt.pro)...[/bold]")
     exchanges = []
     for name in EXCHANGES:
@@ -777,6 +844,14 @@ async def main():
             token_seed_usd=300.0,    # $300 of each whitelist token per exchange
         )
         console.print(f"[cyan]VirtualPortfolio: ${executor.cfg.total_capital_usd} USDT + $300/token/ex (whitelist only)[/cyan]")
+        # Even in paper mode, if any exchange has API keys, publish a read-only real-balance
+        # snapshot so the dashboard's API-keys tab can show the user their actual per-exchange
+        # USDT balance + grand total. fetch_balance is read-only — safe in simulation.
+        authed = {ex_id: ex for ex_id, ex in ex_by_id.items() if getattr(ex, "apiKey", None)}
+        if authed:
+            paper_bal_cache = RealBalanceCache(authed, refresh_sec=60, hub=hub)
+            feeders.append(asyncio.create_task(paper_bal_cache.watch()))
+            console.print(f"[cyan]Balance snapshot (read-only): {list(authed.keys())} every 60s[/cyan]")
     else:
         executor.balance_cache = RealBalanceCache(ex_by_id, refresh_sec=30, hub=hub)
         feeders.append(asyncio.create_task(executor.balance_cache.watch()))
@@ -792,6 +867,7 @@ async def main():
     console.print(f"[cyan]InventoryGuard: stop {guard.cfg.default_threshold_pct}%, cooldown {guard.cfg.cooldown_after_stop_sec}s[/cyan]")
     console.print(f"[cyan]Capital: total=${executor.cfg.total_capital_usd}, reserve={executor.cfg.reserve_pct*100:.0f}%, max/token=${executor.cfg.max_position_per_token_usd}[/cyan]")
 
+    feeders.append(asyncio.create_task(env_watch_loop()))
     feeders.append(asyncio.create_task(time_sync_loop(exchanges, interval_sec=300)))
     feeders.append(asyncio.create_task(leg_risk_logger(executor, interval_sec=float(os.getenv("LEGRISK_LOG_SEC", "900")))))
     feeders.append(asyncio.create_task(health_monitor(executor, interval_sec=600)))
@@ -806,8 +882,8 @@ async def main():
         feeders.append(asyncio.create_task(tg.run()))
         console.print("[cyan]Telegram bot started[/cyan]")
 
-    # Eye Crypt: report status to backend if licensed
-    if os.getenv("EYECRYPT_LICENSE"):
+    # Eye Crypt: report status to backend if a real license is set (skip placeholder)
+    if not is_placeholder_license(os.getenv("EYECRYPT_LICENSE", "")):
         from license import status_reporter
         feeders.append(asyncio.create_task(status_reporter(executor=executor, guard=guard, hedge=hedge)))
         console.print("[cyan]Eye Crypt status reporter started (ping every 5min)[/cyan]")

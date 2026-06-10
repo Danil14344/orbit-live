@@ -23,6 +23,18 @@ LICENSE = os.getenv("EYECRYPT_LICENSE", "")
 PING_INTERVAL_SEC = 300         # 5 min
 REVERIFY_INTERVAL_SEC = 3600    # re-check subscription every hour
 
+# Placeholder values written into a fresh .env (eyecrypt_main._ensure_env). These must
+# be treated as "no license" — otherwise the bot tries to verify the placeholder, gets
+# rejected, and (in hard mode) exits in a crash-loop, so paper trading never starts.
+_PLACEHOLDERS = {
+    "", "paste-your-license-here", "paste-your-license",
+    "your-license-here", "your-license", "changeme",
+}
+
+
+def is_placeholder_license(value: str | None) -> bool:
+    return (value or "").strip() in _PLACEHOLDERS
+
 _current = {"tier": 0, "valid": False, "expires_at": None}
 _DEVICE_ID_FILE = BASE_DIR / ".device_id"
 
@@ -74,36 +86,41 @@ def current_tier() -> int:
     return _current["tier"] if _current["valid"] else 0
 
 
-def verify_or_exit() -> int:
-    """Synchronous startup check. Exits process if license invalid."""
-    if not LICENSE:
-        log.error("EYECRYPT_LICENSE env var not set — get your key from cabinet.eyecrypt.com")
-        sys.exit(1)
+def verify_or_exit(hard: bool = True) -> int:
+    """Synchronous startup license check.
+
+    hard=True  (live mode): exits the process if the license is missing/invalid.
+    hard=False (paper mode): never exits — logs a warning and returns tier 0 so paper
+               (simulation) trading always starts, even with no/placeholder/expired key.
+    """
+    def _fail(msg: str) -> int:
+        log.error(msg)
+        if hard:
+            sys.exit(1)
+        log.warning("running in PAPER mode without a valid license — simulation only")
+        return 0
+
+    if is_placeholder_license(LICENSE):
+        return _fail("EYECRYPT_LICENSE not set — get your key from eyecryptbot.com/cabinet")
     try:
         r = httpx.get(f"{API_BASE}/v1/verify", headers=_hdr(), timeout=10)
     except Exception as e:
-        log.error(f"license server unreachable: {e}")
-        sys.exit(1)
+        return _fail(f"license server unreachable: {e}")
     if r.status_code == 403:
         try:
             d = r.json().get("detail", {})
             if isinstance(d, dict) and d.get("error") == "device_mismatch":
-                log.error("license is already activated on another device.")
-                log.error("Reset the binding in your cabinet (cabinet.eyecrypt.com → Settings → Device)"
-                          " then restart the bot.")
-                sys.exit(1)
+                return _fail("license is already activated on another device. Reset the "
+                             "binding in your cabinet (eyecryptbot.com/cabinet) then restart.")
         except Exception:
             pass
-        log.error(f"license rejected (403): {r.text}")
-        sys.exit(1)
+        return _fail(f"license rejected (403): {r.text}")
     if r.status_code != 200:
-        log.error(f"license rejected ({r.status_code}): {r.text}")
-        sys.exit(1)
+        return _fail(f"license rejected ({r.status_code}): {r.text}")
     data = r.json()
     if not data.get("valid"):
-        log.error(f"subscription not active. Expired: {data.get('expires_at')}")
-        log.error("Renew at https://eyecrypt.com/pricing")
-        sys.exit(1)
+        return _fail(f"subscription not active. Expired: {data.get('expires_at')}. "
+                     "Renew at https://eyecryptbot.com/pricing")
     _current.update(tier=data["tier"], valid=True, expires_at=data["expires_at"])
     log.info(f"license OK — tier {data['tier']}, expires {data['expires_at']}")
     return data["tier"]
@@ -115,7 +132,7 @@ _last_uploaded_ts = 0.0
 def _read_recent_trades(since_ts: float, max_n: int = 200) -> list[dict]:
     """Read trades from local trades.jsonl that happened after since_ts."""
     path = str(BASE_DIR / "trades.jsonl")
-    if not _os.path.exists(path):
+    if not os.path.exists(path):
         return []
     out = []
     try:
