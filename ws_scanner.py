@@ -75,9 +75,13 @@ console = Console()
 def _creds(name):
     upper = name.upper()
     cfg = {}
+    # Accept both naming schemes: the operator's hand-written .env uses {EX}_SECRET /
+    # {EX}_PASSWORD, while the desktop dashboard saves {EX}_API_SECRET /
+    # {EX}_API_PASSPHRASE. Without this fallback, keys entered in the dashboard were
+    # silently ignored and customer LIVE trading ran with no secret.
     k = os.getenv(f"{upper}_API_KEY")
-    s = os.getenv(f"{upper}_SECRET")
-    p = os.getenv(f"{upper}_PASSWORD")
+    s = os.getenv(f"{upper}_SECRET") or os.getenv(f"{upper}_API_SECRET")
+    p = os.getenv(f"{upper}_PASSWORD") or os.getenv(f"{upper}_API_PASSPHRASE")
     uid = os.getenv(f"{upper}_UID")
     if k and s:
         cfg["apiKey"] = k
