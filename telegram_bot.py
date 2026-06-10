@@ -222,35 +222,69 @@ class TelegramBot:
                 "/cancel — отменить подписку\n"
                 "/logout — выйти из аккаунта")
 
+    def _mark(self, asset: str) -> float:
+        """Best mid price for asset/USDT across exchanges (1.0 for USDT, 0 if unknown)."""
+        if asset == "USDT":
+            return 1.0
+        best = 0.0
+        if self.hub is not None:
+            for _ex, tickers in self.hub.tickers.items():
+                t = tickers.get(f"{asset}/USDT")
+                if t:
+                    mid = ((t.get("bid") or 0) + (t.get("ask") or 0)) / 2
+                    if mid > best:
+                        best = mid
+        return best
+
     async def _cmd_balances(self, chat_id: int, ex_filter: str | None = None):
         bc = getattr(self.executor, "balance_cache", None)
         vp = getattr(self.executor, "virtual_portfolio", None)
         lines: list[str] = []
 
         if bc is not None and getattr(bc, "balances", None):
-            total = 0.0
+            grand_spot = 0.0      # spot equity (USDT + token value) across venues
+            DUST_USD = 1.0        # hide balances worth less than this
             for ex_id in sorted(bc.balances):
                 if ex_filter and ex_id != ex_filter:
                     continue
                 bals = {k: v for k, v in bc.balances[ex_id].items() if v and v > 0}
                 age = time.time() - bc.last_update.get(ex_id, 0)
                 err = bc.errors.get(ex_id)
-                head = f"<b>{html.escape(ex_id)}</b> <i>({_fmt_age(age)} назад)</i>"
                 if err:
-                    lines.append(f"{head}\n  ⚠️ {html.escape(err)}")
+                    lines.append(f"<b>{html.escape(ex_id)}</b> <i>({_fmt_age(age)} назад)</i>\n  ⚠️ {html.escape(err)}")
                     continue
-                if not bals:
-                    lines.append(f"{head}\n  — пусто")
+                # value each asset in USD; sum the venue's spot equity; hide dust < $1
+                ex_value = 0.0
+                shown = []
+                for a, q in bals.items():
+                    val = q if a == "USDT" else q * self._mark(a)
+                    ex_value += val
+                    if val >= DUST_USD:
+                        shown.append((a, q, val))
+                grand_spot += ex_value
+                head = f"<b>{html.escape(ex_id)}</b> <i>({_fmt_age(age)} назад)</i> — ~{_fmt_usd(ex_value)}"
+                if not shown:
+                    lines.append(f"{head}\n  — пусто (только пыль)")
                     continue
-                usdt = bals.get("USDT", 0)
-                total += usdt
                 body = "\n".join(
-                    f"  {html.escape(a)}: {q:,.6g}".rstrip("0").rstrip(".")
-                    for a, q in sorted(bals.items(), key=lambda x: -x[1])[:15]
+                    f"  {html.escape(a)}: {q:,.6g} (~{_fmt_usd(val)})".replace(",", " ")
+                    for a, q, val in sorted(shown, key=lambda x: -x[2])[:15]
                 )
                 lines.append(f"{head}\n{body}")
             if not ex_filter:
-                lines.append(f"\n<b>Σ USDT (free): {_fmt_usd(total)}</b>")
+                # add futures wallet USDT (bingx hedge venue) for a true spot+futures total
+                fut_usdt = 0.0
+                hedge = getattr(self.executor, "hedge", None)
+                if hedge is not None and getattr(hedge, "futures", None) is not None:
+                    try:
+                        fb = await hedge.futures.fetch_balance()
+                        fut_usdt = float((fb.get("total") or {}).get("USDT") or 0)
+                    except Exception:
+                        fut_usdt = 0.0
+                lines.append(f"\n<b>Σ спот: {_fmt_usd(grand_spot)}</b>")
+                if fut_usdt:
+                    lines.append(f"<b>Σ фьючи: {_fmt_usd(fut_usdt)}</b>")
+                lines.append(f"<b>Σ ВСЕГО (спот+фьючи): {_fmt_usd(grand_spot + fut_usdt)}</b>")
         elif vp is not None:
             for ex_id in sorted(vp.balances):
                 if ex_filter and ex_id != ex_filter:

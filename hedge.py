@@ -82,6 +82,33 @@ class HedgeManager:
                 base = m.get("base")
                 if base and (tokens is None or base in tokens):
                     self.perp_symbol[base] = sym
+        # Sync tracked shorts to ACTUAL open futures positions. Persisted state (or
+        # dry-run bookkeeping) can otherwise create a phantom short across restarts —
+        # which both blocks the real short from opening (delta=0) and triggers bogus
+        # reduceOnly closes. Reality from the exchange is the source of truth.
+        try:
+            positions = await self.futures.fetch_positions()
+            real = {}
+            for p in positions:
+                c = float(p.get("contracts") or 0)
+                if c > 0 and p.get("side") == "short":
+                    base = (p.get("symbol") or "").split("/")[0]
+                    real[base] = float(p.get("entryPrice") or 0)
+            for token in list(self.shorts.keys()):
+                if token not in real:
+                    self.shorts[token] = {"qty": 0.0, "entry_avg": 0.0, "opened_ts": 0.0, "last_funding_ts": 0.0}
+            for base, entry in real.items():
+                s = self.shorts[base]
+                s["qty"] = next(float(p.get("contracts") or 0) for p in positions
+                                if (p.get("symbol") or "").split("/")[0] == base and p.get("side") == "short")
+                s["entry_avg"] = entry
+                if s["opened_ts"] == 0:
+                    s["opened_ts"] = time.time(); s["last_funding_ts"] = time.time()
+            self._save_state()
+            log.info(f"[HEDGE setup] synced shorts to real positions: "
+                     f"{ {k: round(v['qty'], 4) for k, v in self.shorts.items() if v['qty'] > 0} }")
+        except Exception as e:
+            log.warning(f"[HEDGE setup] position sync skipped: {str(e)[:90]}")
         # Leverage is forced to 1x lazily on first order per symbol (see _place) to
         # avoid hammering the API with hundreds of set_leverage calls at startup.
         self._setup_done = True
@@ -109,11 +136,20 @@ class HedgeManager:
             log.info(f"[HEDGE DRY-RUN] would {side} {amt} {sym} reduceOnly={reduce_only} (no order sent)")
             return
         # Force 1x leverage once per symbol, right before the first real order.
+        # bingx requires a `side` arg on setLeverage; in one-way mode it's BOTH.
+        # Without it the call errors and the symbol keeps the exchange default (e.g.
+        # 20x) — dangerous: a tight isolated liq on a volatile microcap.
         if sym not in self._lev_set:
-            try:
-                await self.futures.set_leverage(self.cfg.leverage, sym)
-            except Exception as e:
-                log.debug(f"[HEDGE] set_leverage 1x {sym} skipped: {str(e)[:80]}")
+            ok = False
+            for params_lev in ({"side": "BOTH"}, {}):
+                try:
+                    await self.futures.set_leverage(self.cfg.leverage, sym, params_lev)
+                    ok = True
+                    break
+                except Exception as e:
+                    log.debug(f"[HEDGE] set_leverage {self.cfg.leverage}x {sym} params={params_lev}: {str(e)[:70]}")
+            if not ok:
+                log.warning(f"[HEDGE] set_leverage {self.cfg.leverage}x {sym} FAILED — symbol keeps exchange default leverage")
             self._lev_set.add(sym)
         order = await self.futures.create_order(sym, "market", side, amt, None, params)
         log.info(f"[HEDGE LIVE] {side} {amt} {sym} reduceOnly={reduce_only} -> id={order.get('id')}")

@@ -601,6 +601,44 @@ async def health_monitor(executor, interval_sec=600):
             hl.warning(f"health check failed: {str(e)[:80]}")
 
 
+async def hedge_reconcile_loop(executor, hedge, interval_sec=60):
+    """Keep the perp short matched to the actual held SPOT inventory of each
+    hedgeable whitelisted token (delta-neutral). This hedges rebalancer-seeded
+    inventory (e.g. VELVET) that never passed through the executor. Single source
+    of truth = real balances; respects hedge.cfg.dry_run (logs intended shorts)."""
+    from executor import WHITELIST_TOKENS
+    hl = get_logger("hedge")
+    if hedge is None or not getattr(hedge.cfg, "enabled", False):
+        hl.info("hedge reconcile loop: hedge disabled — not running")
+        return
+    hl.info(f"hedge reconcile loop started (interval={interval_sec}s, dry_run={hedge.cfg.dry_run})")
+    await asyncio.sleep(45)   # let balances + hub marks warm up before first action
+    while True:
+        try:
+            bc = executor.balance_cache
+            exids = list(executor.ex_by_id.keys())
+            now = time.time()
+            # Only act on a WARM cache — a cold/stale cache reads 0 held and would
+            # spuriously close real hedges. Require a recent refresh for every venue.
+            cache_warm = bc is not None and all((now - bc.last_update.get(e, 0)) < 90 for e in exids)
+            if cache_warm:
+                # Check every hedgeable token we hold (whitelist) OR already short.
+                tokens = set(WHITELIST_TOKENS) | {t for t, s in hedge.shorts.items() if s["qty"] > 0}
+                for token in tokens:
+                    if not hedge.can_hedge(token) or token.upper() in hedge.exclude:
+                        continue
+                    mark = hedge._best_mark(token)
+                    if mark <= 0:
+                        continue  # can't price it now — NEVER close/adjust a hedge blind
+                    total = sum((bc.available(e, token) or 0) for e in exids)
+                    # target short = held spot (or 0 if only dust remains)
+                    target = total if (total * mark) >= hedge.cfg.min_hedge_qty_usd else 0.0
+                    await hedge.adjust(token, target, mark)
+        except Exception as e:
+            hl.warning(f"hedge reconcile failed: {type(e).__name__}: {str(e)[:90]}")
+        await asyncio.sleep(interval_sec)
+
+
 async def leg_risk_logger(executor, interval_sec=900):
     """Periodically log the leg-risk telemetry summary (outcome mix, slippage,
     ws pre-exec hit rate) so tuning is data-driven."""
@@ -699,6 +737,10 @@ async def main():
         volatility_factor=float(os.getenv("VOLATILITY_FACTOR", "0.05")),
         skew_max_tighten_pct=float(os.getenv("INV_SKEW_MAX_PCT", "0.1")),
         require_depth_full=os.getenv("REQUIRE_DEPTH_FULL", "0").lower() in ("1", "true", "yes"),
+        # Adaptive IOC buffer (fix one-legged mexc sell misses on volatile microcaps)
+        ioc_buffer_net_frac=float(os.getenv("IOC_BUFFER_NET_FRAC", "0.25")),
+        ioc_buffer_min_pct=float(os.getenv("IOC_BUFFER_MIN_PCT", "0.15")),
+        ioc_buffer_max_pct=float(os.getenv("IOC_BUFFER_MAX_PCT", "0.60")),
         journal_path="trades.jsonl",
         state_path="executor_state.json",
     ))
@@ -736,7 +778,7 @@ async def main():
         )
         console.print(f"[cyan]VirtualPortfolio: ${executor.cfg.total_capital_usd} USDT + $300/token/ex (whitelist only)[/cyan]")
     else:
-        executor.balance_cache = RealBalanceCache(ex_by_id, refresh_sec=30)
+        executor.balance_cache = RealBalanceCache(ex_by_id, refresh_sec=30, hub=hub)
         feeders.append(asyncio.create_task(executor.balance_cache.watch()))
         console.print(f"[cyan]RealBalanceCache: refresh every 30s[/cyan]")
         # Auto-rebalancer: keeps live positioned in the tokens producing windows on the
@@ -754,6 +796,7 @@ async def main():
     feeders.append(asyncio.create_task(leg_risk_logger(executor, interval_sec=float(os.getenv("LEGRISK_LOG_SEC", "900")))))
     feeders.append(asyncio.create_task(health_monitor(executor, interval_sec=600)))
     feeders.append(asyncio.create_task(state_backup_loop(interval_sec=3600, keep=72)))
+    feeders.append(asyncio.create_task(hedge_reconcile_loop(executor, hedge, interval_sec=60)))
 
     # Telegram control & monitoring bot (optional — enabled via TELEGRAM_BOT_TOKEN)
     if os.getenv("TELEGRAM_BOT_TOKEN"):

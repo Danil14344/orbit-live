@@ -115,6 +115,12 @@ class ExecConfig:
     # IOC limit orders for live (safer than market)
     use_ioc_orders: bool = True
     ioc_price_buffer_pct: float = 0.20     # buy at ask × (1+buffer), sell at bid × (1-buffer); covers micro-jitter so legs cross
+    # Adaptive IOC buffer: buf = clamp(net% * frac, min, max). Scales aggression
+    # with the spread so fat-spread legs cross through book jitter (fixing the
+    # one-legged mexc sell misses) while thin opps stay tight (buffer never eats edge).
+    ioc_buffer_net_frac: float = 0.25
+    ioc_buffer_min_pct: float = 0.15
+    ioc_buffer_max_pct: float = 0.60
     # Cooldown legacy alias (kept for compatibility)
     cooldown_per_pair_sec: int = 60
 
@@ -630,9 +636,14 @@ class Executor:
 
         sym = opp["symbol"]
         target_base = position_usd / opp["vwap_ask"]
-        # IOC limit prices: small buffer to ensure crossing the spread
-        ioc_buy_price = opp["vwap_ask"] * (1 + self.cfg.ioc_price_buffer_pct / 100)
-        ioc_sell_price = opp["vwap_bid"] * (1 - self.cfg.ioc_price_buffer_pct / 100)
+        # Adaptive IOC buffer: scale with the spread so fat-spread legs cross even
+        # when a volatile microcap's top-of-book jitters (the mexc sell leg was
+        # missing at a flat 0.2% buffer), while thin opps keep a tight buffer.
+        _net = opp.get("real_net_pct", 0) or 0
+        buf = max(self.cfg.ioc_buffer_min_pct,
+                  min(self.cfg.ioc_buffer_max_pct, _net * self.cfg.ioc_buffer_net_frac))
+        ioc_buy_price = opp["vwap_ask"] * (1 + buf / 100)
+        ioc_sell_price = opp["vwap_bid"] * (1 - buf / 100)
 
         # Pre-execution sanity check — verify spread still real via fresh REST
         if self.cfg.pre_exec_sanity_check:
@@ -685,8 +696,8 @@ class Executor:
                 # while the sell leg crossed → one-legged fills.
                 if fresh_ask > 0 and fresh_bid > 0:
                     target_base = position_usd / fresh_ask
-                    ioc_buy_price = fresh_ask * (1 + self.cfg.ioc_price_buffer_pct / 100)
-                    ioc_sell_price = fresh_bid * (1 - self.cfg.ioc_price_buffer_pct / 100)
+                    ioc_buy_price = fresh_ask * (1 + buf / 100)
+                    ioc_sell_price = fresh_bid * (1 - buf / 100)
             except Exception as e:
                 rec.status = "aborted_sanity_check"
                 rec.error = f"sanity check failed: {str(e)[:80]}"
@@ -723,7 +734,7 @@ class Executor:
 
         log.info(
             f"[ORDER PLACE] BUY {sym}@{opp['buy_ex']} qty={target_base:.4f} ioc_price={ioc_buy_price:.6g} | "
-            f"SELL {sym}@{opp['sell_ex']} qty={target_base:.4f} ioc_price={ioc_sell_price:.6g}"
+            f"SELL {sym}@{opp['sell_ex']} qty={target_base:.4f} ioc_price={ioc_sell_price:.6g} | buf={buf:.3f}%"
         )
         # Fire both in parallel
         results = await asyncio.gather(buy(), sell(), return_exceptions=True)

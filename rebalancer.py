@@ -423,8 +423,15 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
     if not dry:
         WHITELIST_TOKENS.clear()
         WHITELIST_TOKENS.update(new_wl)
-        hedge.exclude |= new_wl   # auto-managed microcaps stay unhedged
-        log.info(f"[REBAL] whitelist updated in-process -> {sorted(WHITELIST_TOKENS)}; hedge.exclude={sorted(hedge.exclude)}")
+        # Hedge what we CAN (has a perp); leave only un-hedgeable microcaps excluded.
+        # hedge_reconcile_loop then shorts the held inventory of the hedgeable ones.
+        for t in new_wl:
+            if hedge.can_hedge(t):
+                hedge.exclude.discard(t)
+            else:
+                hedge.exclude.add(t)
+        log.info(f"[REBAL] whitelist updated in-process -> {sorted(WHITELIST_TOKENS)}; "
+                 f"hedge.exclude={sorted(hedge.exclude)} (hedgeable seeded tokens will be shorted)")
     else:
         log.info(f"[REBAL DRY] would set whitelist -> {sorted(new_wl)} (no change applied)")
 

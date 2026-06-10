@@ -18,30 +18,62 @@ log = get_logger("balances")
 class RealBalanceCache:
     """Live mode: cache of real exchange balances, refreshed every N sec."""
 
-    def __init__(self, ex_by_id, refresh_sec=30, snapshot_path=str(BASE_DIR / "balances_snapshot.json")):
+    def __init__(self, ex_by_id, refresh_sec=30, snapshot_path=str(BASE_DIR / "balances_snapshot.json"), hub=None):
         self.ex_by_id = ex_by_id
         self.refresh_sec = refresh_sec
         self.balances: dict[str, dict[str, float]] = defaultdict(dict)
         self.last_update: dict[str, float] = {}
         self.errors: dict[str, str] = {}
         self.snapshot_path = snapshot_path
+        self.hub = hub                       # for USD valuation (dust filter)
+
+    DUST_USD = 1.0                            # hide balances worth less than this
+
+    def _mark(self, asset: str) -> float:
+        """Best mid price for asset/USDT across exchanges (1.0 USDT, 0 if unknown)."""
+        if asset == "USDT":
+            return 1.0
+        if self.hub is None:
+            return 0.0
+        best = 0.0
+        for _ex, tickers in self.hub.tickers.items():
+            t = tickers.get(f"{asset}/USDT")
+            if t:
+                mid = ((t.get("bid") or 0) + (t.get("ask") or 0)) / 2
+                if mid > best:
+                    best = mid
+        return best
 
     def write_snapshot(self):
         """Persist current balances to JSON so other processes (dashboard / Mini App)
-        can read live balances without sharing this in-memory object."""
+        can read live balances without sharing this in-memory object. Balances worth
+        less than DUST_USD are filtered out; per-exchange + total spot USD value added."""
         try:
+            exchanges = {}
+            spot_value_total = 0.0
+            for ex_id, bals in self.balances.items():
+                shown = {}
+                ex_value = 0.0
+                for k, v in bals.items():
+                    if not v or v <= 0:
+                        continue
+                    val = v if k == "USDT" else v * self._mark(k)
+                    ex_value += val
+                    if val >= self.DUST_USD:     # drop near-zero dust
+                        shown[k] = v
+                spot_value_total += ex_value
+                exchanges[ex_id] = {
+                    "balances": shown,
+                    "usdt": bals.get("USDT", 0),
+                    "value_usd": round(ex_value, 2),
+                    "updated_at": self.last_update.get(ex_id, 0),
+                    "error": self.errors.get(ex_id),
+                }
             data = {
                 "ts": time.time(),
-                "exchanges": {
-                    ex_id: {
-                        "balances": {k: v for k, v in bals.items() if v and v > 0},
-                        "usdt": bals.get("USDT", 0),
-                        "updated_at": self.last_update.get(ex_id, 0),
-                        "error": self.errors.get(ex_id),
-                    }
-                    for ex_id, bals in self.balances.items()
-                },
+                "exchanges": exchanges,
                 "usdt_total": sum(b.get("USDT", 0) for b in self.balances.values()),
+                "spot_value_total": round(spot_value_total, 2),
             }
             with open(self.snapshot_path, "w") as f:
                 json.dump(data, f)

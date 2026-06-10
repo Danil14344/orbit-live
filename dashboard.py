@@ -595,8 +595,9 @@ async function load() {
           `<div class="exsub">${d.error?'<span class=err>'+d.error+'</span>':(assets||'—')} · ${ago(d.updated_at)}</div></div>`+
           `<div class="exval"><div class="u">${usd(d.usdt||0)}</div><div class="a">USDT</div></div></div>`;
       }
-      rows += `<div class="exrow"><div class="exname gradient-text">Итого</div>`+
-        `<div class="exval"><div class="u gradient-text">${usd(ba.usdt_total||0)}</div><div class="a">USDT free</div></div></div>`;
+      const totVal = (ba.spot_value_total!=null) ? ba.spot_value_total : (ba.usdt_total||0);
+      rows += `<div class="exrow"><div class="exname gradient-text">Итого (спот)</div>`+
+        `<div class="exval"><div class="u gradient-text">${usd(totVal)}</div><div class="a">всего</div></div></div>`;
       bc.innerHTML=rows;
     } else {
       bc.innerHTML='<div class="muted">балансы недоступны (бот в paper-режиме или ещё не запущен)</div>';
