@@ -280,9 +280,11 @@ class XemmBot:
         qty = min(self.order_usd / sell_px, tok_mk)
         if qty * sell_px >= 5 and usdt_tk >= qty * t_ask * 1.01:
             plans.append(("sell", sell_px, qty))
-        # buy side: need USDT on maker + token on taker for the hedge sell
-        qty = self.order_usd / buy_px
-        if usdt_mk >= qty * buy_px * 1.001 and tok_tk >= qty:
+        # buy side: need USDT on maker + token on taker for the hedge sell.
+        # Adapt to what's actually there (like the sell side) instead of
+        # requiring the full order size — small quote beats no quote.
+        qty = min(self.order_usd, usdt_mk * 0.99, tok_tk * buy_px) / buy_px
+        if qty * buy_px >= 5:
             plans.append(("buy", buy_px, qty))
 
         planned_sides = {p[0] for p in plans}
