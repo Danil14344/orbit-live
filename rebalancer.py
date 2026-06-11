@@ -346,10 +346,28 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
                 ok_all = False
                 break
         if ok_all:
+            # Funding check: the delta-neutral pair (spot long + perp short) PAYS us
+            # when funding is positive and bleeds hourly when strongly negative —
+            # skip candidates whose hedge would cost more than dust unless nothing
+            # else qualifies (spread pnl usually dominates, so the bar is low).
+            fr_pct = None
+            if hedge is not None and getattr(hedge, "futures", None) is not None \
+                    and hedge.can_hedge(tok):
+                try:
+                    fri = await hedge.futures.fetch_funding_rate(hedge.perp_symbol[tok])
+                    fr_pct = float(fri.get("fundingRate") or 0) * 100
+                except Exception:
+                    pass
+            min_funding = _f("REBALANCE_MIN_FUNDING_PCT", "-0.1")
+            if fr_pct is not None and fr_pct < min_funding:
+                log.info(f"[REBAL] skip {tok}: funding {fr_pct:.3f}%/interval < {min_funding}% "
+                         f"(short hedge would bleed)")
+                continue
             target.append(tok)
             log.info(f"[REBAL] candidate {tok}: windows={stats['windows']} trades={stats['trades']} "
                      f"pnl=${stats['pnl']:.2f} median_net={stats.get('median_net', 0):.2f}% "
-                     f"avg_net={stats['avg_net']:.2f}% — liquidity OK")
+                     f"avg_net={stats['avg_net']:.2f}% funding={'' if fr_pct is None else f'{fr_pct:.3f}%'} "
+                     f"— liquidity OK")
         else:
             log.info(f"[REBAL] skip {tok}: insufficient liquidity for ${per_token_usd:.0f} within {slip_cap}%")
 
