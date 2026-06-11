@@ -167,7 +167,11 @@ def analyze_shadow(path, lookback_h, min_windows, min_net_pct=0.0, window_gap_se
             log.warning(f"[REBAL] skip {tok}: qualifying-median net {med_net:.1f}% > {max_net_pct:.1f}% — "
                         f"suspicious (likely suspended transfers/delisting)")
             continue
-        if windows >= min_windows:
+        # A continuous hour-long stream clusters into ONE window and used to fail
+        # min_windows>=2 (GENIUS: 107 above-threshold ticks/h, zero candidacy) —
+        # accept sustained streams by tick count too.
+        min_trades = int(os.getenv("REBALANCE_MIN_TRADES", "40"))
+        if windows >= min_windows or len(qual) >= min_trades:
             out.append((tok, {"windows": windows, "trades": len(qual), "pnl": pnl,
                               "avg_net": sum(nets) / len(nets),
                               "median_net": med_net}))

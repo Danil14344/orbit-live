@@ -459,13 +459,25 @@ class Executor:
                 self.virtual_portfolio.would_block_count += 1
                 # Don't reject — let perfect-capital paper continue. But count.
         elif self.cfg.mode == Mode.LIVE and self.balance_cache is not None:
-            base_amount = position / opp["vwap_ask"]
             usdt_have = self.balance_cache.available(opp["buy_ex"], "USDT")
             base_have = self.balance_cache.available(opp["sell_ex"], base)
             if usdt_have < position * 1.01:    # 1% buffer for fee
-                return False, f"no USDT on {opp['buy_ex']} (${usdt_have:.2f}<${position:.0f})", 0
+                # Shrink to the USDT actually on the buy venue rather than skipping
+                # the window outright — 39 above-threshold opps died overnight on
+                # "no USDT on mexc ($11<$25)" while $160 idled on the other venues.
+                shrunk = usdt_have / 1.01
+                floor = max(min_required * 1.05 if min_required > 0 else 0.0, 5.0)
+                if shrunk < floor:
+                    return False, f"no USDT on {opp['buy_ex']} (${usdt_have:.2f}<${position:.0f})", 0
+                position = shrunk
+            base_amount = position / opp["vwap_ask"]
             if base_have < base_amount:
-                return False, f"no {base} on {opp['sell_ex']} ({base_have:.4f}<{base_amount:.4f})", 0
+                # Same idea on the sell side: trade the inventory we do have.
+                shrunk = base_have * opp["vwap_ask"]
+                floor = max(min_required * 1.05 if min_required > 0 else 0.0, 5.0)
+                if shrunk < floor:
+                    return False, f"no {base} on {opp['sell_ex']} ({base_have:.4f}<{base_amount:.4f})", 0
+                position = min(position, shrunk)
 
         # Total capital binding check — sum of the actual sizes of in-flight trades
         used_capital = sum(self.active_position_usd.values())
