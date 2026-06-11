@@ -32,6 +32,9 @@ from typing import Optional
 BANNED_TOKENS = {
     t.strip().upper() for t in os.getenv("BANNED_TOKENS", "").split(",") if t.strip()
 }
+# (exchange_id, symbol) pairs the venue refuses to trade via API (learned at runtime
+# from order errors like bingx 100421). Reset on restart — cheap to re-learn.
+API_BANNED_PAIRS: set[tuple] = set()
 
 # Whitelist mode — if non-empty, ONLY these tokens are traded. Others are logged
 # to shadow_opps.jsonl as "would have traded" for later analysis (swap candidates).
@@ -403,6 +406,9 @@ class Executor:
         if base in BANNED_TOKENS:
             return False, f"banned token ({base})", 0
 
+        if (opp["buy_ex"], sym) in API_BANNED_PAIRS or (opp["sell_ex"], sym) in API_BANNED_PAIRS:
+            return False, f"api-banned pair ({sym})", 0
+
         if WHITELIST_TOKENS and base not in WHITELIST_TOKENS:
             # The whitelist is a FUNDING policy (what the rebalancer seeds), not a
             # trade gate. If we already hold enough of the token on the sell side
@@ -758,6 +764,14 @@ class Executor:
         buy_ok = not isinstance(buy_res, Exception)
         sell_ok = not isinstance(sell_res, Exception)
 
+        # Venue-level API trading bans are permanent for the symbol (e.g. bingx
+        # 100421 "this symbol is not allowed to place via api" on GENIUS) — learn
+        # the pair so allowed() stops feeding it (-$0.50 lesson on 2026-06-11).
+        for _ok, _res, _exid in ((buy_ok, buy_res, opp["buy_ex"]), (sell_ok, sell_res, opp["sell_ex"])):
+            if not _ok and "not allowed to place via api" in str(_res):
+                API_BANNED_PAIRS.add((_exid, sym))
+                log.warning(f"[API-BAN] {sym}@{_exid}: symbol not tradeable via API — pair banned for this run")
+
         async def _reconcile(ex, res):
             """Return (filled_qty, avg_price). Some venues (e.g. mexc IOC) return
             filled/average=None on the create response even when the order executed.
@@ -832,10 +846,15 @@ class Executor:
                     rec.status = "kept_buy_excess"
                 else:
                     qty = -residual
-                    log.warning(f"[IMBALANCE] over-sold {qty:.4f} {token}@{opp['sell_ex']} — market_buy to flatten")
+                    log.warning(f"[IMBALANCE] over-sold {qty:.4f} {token}@{opp['sell_ex']} — aggressive IOC buy to flatten")
                     try:
+                        # Limit IOC instead of market buy: bitget's market buys take
+                        # COST not qty (createMarketBuyOrderRequiresPrice) — an
+                        # aggressive crossing limit behaves identically everywhere.
+                        _px = float(ex_sell.price_to_precision(sym, unwind_price * 1.01))
                         cres = await asyncio.wait_for(
-                            ex_sell.create_market_buy_order(sym, qty), timeout=self.cfg.order_timeout_sec)
+                            ex_sell.create_order(sym, "limit", "buy", qty, _px, {"timeInForce": "IOC"}),
+                            timeout=self.cfg.order_timeout_sec)
                         cf, cp = await _reconcile(ex_sell, cres)
                         if self.guard is not None:
                             self.guard.on_fill(opp["sell_ex"], token, "buy", cf or qty, cp or sell_price)
@@ -916,9 +935,12 @@ class Executor:
                 self.guard.on_fill(opp["sell_ex"], token, "sell", filled, sell_price)
             try:
                 if filled > 0:
-                    log.warning(f"[HEDGE] buy failed — closing sell leg: market_buy {sym}@{opp['sell_ex']} qty={filled:.4f}")
+                    log.warning(f"[HEDGE] buy failed — closing sell leg: IOC buy {sym}@{opp['sell_ex']} qty={filled:.4f}")
+                    # Aggressive crossing IOC, not market buy — bitget market buys
+                    # take COST not qty and error without a price.
+                    _px = float(ex_sell.price_to_precision(sym, sell_price * 1.01))
                     close_res = await asyncio.wait_for(
-                        ex_sell.create_market_buy_order(sym, filled),
+                        ex_sell.create_order(sym, "limit", "buy", filled, _px, {"timeInForce": "IOC"}),
                         timeout=self.cfg.order_timeout_sec,
                     )
                     if self.guard is not None:
