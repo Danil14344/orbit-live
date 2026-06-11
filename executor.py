@@ -36,6 +36,16 @@ BANNED_TOKENS = {
 # from order errors like bingx 100421). Reset on restart — cheap to re-learn.
 API_BANNED_PAIRS: set[tuple] = set()
 
+# Liquid majors: their true cross-exchange spread is <0.05%. Any "window" above a
+# few bps is a stale/lagging feed, not arb — buying never crosses, the sell leg
+# one-legs, and we eat fees + dust (BTC: 3 phantom 0.4-1.4% windows, all one-legged,
+# left ~$9 dust on 2026-06-11). Hard-skip them regardless of apparent spread.
+MAJOR_TOKENS = {
+    t.strip().upper() for t in os.getenv(
+        "MAJOR_TOKENS", "BTC,ETH,BNB,SOL,XRP,ADA,DOGE,TRX,LTC,BCH,DOT,AVAX,LINK,USDC"
+    ).split(",") if t.strip()
+}
+
 # Whitelist mode — if non-empty, ONLY these tokens are traded. Others are logged
 # to shadow_opps.jsonl as "would have traded" for later analysis (swap candidates).
 # Loaded from WHITELIST env var (comma-separated bases, e.g. "OPG,ULTIMA,BSB").
@@ -408,6 +418,9 @@ class Executor:
 
         if base in BANNED_TOKENS:
             return False, f"banned token ({base})", 0
+
+        if base in MAJOR_TOKENS:
+            return False, f"major (phantom spread) ({base})", 0
 
         if (opp["buy_ex"], sym) in API_BANNED_PAIRS or (opp["sell_ex"], sym) in API_BANNED_PAIRS:
             return False, f"api-banned pair ({sym})", 0
@@ -840,13 +853,14 @@ class Executor:
                 dead_side = "BUY" if buy_filled <= 0 else "SELL"
                 our_px = ioc_buy_price if buy_filled <= 0 else ioc_sell_price
                 try:
+                    our_px = float(our_px or 0)
                     ob = await asyncio.wait_for(dead_ex.fetch_order_book(sym, limit=5), timeout=2.0)
                     if dead_side == "BUY":
-                        lvl = ob["asks"][0][0] if ob.get("asks") else 0   # need ask <= our bid
+                        lvl = float((ob.get("asks") or [[0]])[0][0] or 0)   # need ask <= our bid
                         gap = (lvl / our_px - 1) * 100 if our_px else 0
                         miss = lvl > our_px
                     else:
-                        lvl = ob["bids"][0][0] if ob.get("bids") else 0   # need bid >= our ask
+                        lvl = float((ob.get("bids") or [[0]])[0][0] or 0)   # need bid >= our ask
                         gap = (our_px / lvl - 1) * 100 if lvl else 0
                         miss = lvl < our_px
                     verdict = "price_missed" if miss else "book_moved/size"
@@ -854,7 +868,7 @@ class Executor:
                     log.warning(
                         f"[LEG-MISS] {dead_side} {sym}@{dead_ex.id} filled=0 | our_ioc={our_px:.6g} "
                         f"book_top={lvl:.6g} gap={gap:+.3f}% verdict={verdict} "
-                        f"| opp_age={rec.opp_age_ms:.0f}ms buf={buf:.3f}%"
+                        f"| opp_age={float(rec.opp_age_ms or 0):.0f}ms buf={buf:.3f}%"
                     )
                 except Exception as e:
                     self.leg_miss[f"{dead_ex.id}:unknown"] += 1
