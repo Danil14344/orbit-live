@@ -864,6 +864,10 @@ async def main():
         from rebalancer import rebalance_watcher, _enabled as _rebal_enabled, _dry_run as _rebal_dry
         feeders.append(asyncio.create_task(rebalance_watcher(executor, hedge, hub, ex_by_id)))
         console.print(f"[cyan]Rebalancer: enabled={_rebal_enabled()} dry_run={_rebal_dry()}[/cyan]")
+        # XEMM: passive maker quotes on mexc (0% maker fee) hedged taker-side on fill.
+        from xemm import xemm_watcher, _enabled as _xemm_enabled, _dry as _xemm_dry
+        feeders.append(asyncio.create_task(xemm_watcher(executor, hub, ex_by_id)))
+        console.print(f"[cyan]XEMM: enabled={_xemm_enabled()} dry_run={_xemm_dry()}[/cyan]")
 
     mode_color = "green" if EXEC_MODE == Mode.PAPER else "red bold"
     console.print(f"[{mode_color}]Executor: {EXEC_MODE.value.upper()} | adaptive ${executor.cfg.min_position_usd}-${executor.cfg.max_position_usd} | min_net={EXEC_MIN_NET_PCT}%[/{mode_color}]")
