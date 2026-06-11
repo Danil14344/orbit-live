@@ -143,6 +143,10 @@ class HedgeManager:
         # every reconcile pass. Partial hedge > no hedge.
         if not reduce_only:
             mark = self._best_mark(token)
+            # Pull missing margin from the venue's spot wallet first (auto-flow),
+            # then cap to whatever is actually free.
+            if mark > 0:
+                await self._ensure_margin(sym, amt * mark / self.cfg.leverage * 1.05)
             free = -1.0
             try:
                 bal = await self.futures.fetch_balance()
@@ -293,6 +297,68 @@ class HedgeManager:
                     best = mid
         return best
 
+    # ---------- Auto margin flow: spot <-> futures USDT on the hedge venue ----------
+    async def _ensure_margin(self, sym: str, need_usd: float):
+        """Top up futures USDT from the same venue's SPOT wallet when free margin
+        can't carry a new short. Keeps HEDGE_SPOT_USDT_RESERVE on spot (that USDT
+        funds arb buys / XEMM hedges)."""
+        if self.cfg.dry_run or self.futures is None:
+            return
+        try:
+            bal = await self.futures.fetch_balance()
+            free = float((bal.get("USDT") or {}).get("free") or 0)
+        except Exception:
+            return
+        if free >= need_usd:
+            return
+        shortfall = need_usd - free + 1.0
+        spot = self.ex_by_id.get(self.cfg.futures_exchange)
+        if spot is None:
+            return
+        try:
+            sbal = await spot.fetch_balance()
+            sfree = float((sbal.get("USDT") or {}).get("free") or 0)
+        except Exception as e:
+            log.debug(f"[HEDGE] spot balance for top-up: {e}")
+            return
+        reserve = float(os.getenv("HEDGE_SPOT_USDT_RESERVE", "25"))
+        amt = min(shortfall, max(0.0, sfree - reserve))
+        if amt < 1.0:
+            if time.time() >= getattr(self, "_topup_mute_until", 0):
+                log.warning(f"[HEDGE] margin top-up impossible for {sym}: spot free=${sfree:.0f} "
+                            f"reserve=${reserve:.0f} shortfall=${shortfall:.0f} (muted 10min)")
+                self._topup_mute_until = time.time() + 600
+            return
+        try:
+            await spot.transfer("USDT", round(amt, 2), "spot", "swap")
+            log.info(f"[HEDGE] margin top-up: ${amt:.2f} spot->swap on "
+                     f"{self.cfg.futures_exchange} for {sym}")
+        except Exception as e:
+            log.warning(f"[HEDGE] margin top-up transfer failed: {str(e)[:120]}")
+
+    async def sweep_excess_margin(self):
+        """Return idle futures USDT back to spot so it can trade. Keeps a small
+        buffer; isolated-margin locked under open shorts is untouched (not 'free')."""
+        if not self.live or self.cfg.dry_run or self.futures is None:
+            return
+        try:
+            bal = await self.futures.fetch_balance()
+            free = float((bal.get("USDT") or {}).get("free") or 0)
+        except Exception:
+            return
+        keep = float(os.getenv("HEDGE_SWAP_USDT_BUFFER", "15"))
+        excess = free - keep
+        if excess < 5.0:
+            return
+        spot = self.ex_by_id.get(self.cfg.futures_exchange)
+        if spot is None:
+            return
+        try:
+            await spot.transfer("USDT", round(excess, 2), "swap", "spot")
+            log.info(f"[HEDGE] margin sweep: ${excess:.2f} swap->spot on {self.cfg.futures_exchange}")
+        except Exception as e:
+            log.warning(f"[HEDGE] margin sweep transfer failed: {str(e)[:120]}")
+
     # ---------- Mark-to-market PnL of all open shorts ----------
     def unrealized_pnl_usd(self) -> float:
         total = 0.0
@@ -315,11 +381,15 @@ import asyncio
 
 
 async def hedge_watcher(hedge: HedgeManager, interval_sec: float = 60.0):
-    """Background loop: accrue funding periodically."""
+    """Background loop: accrue funding; sweep idle futures margin back to spot."""
     log.info(f"hedge watcher started (interval={interval_sec}s, enabled={hedge.cfg.enabled})")
+    tick = 0
     while True:
         await asyncio.sleep(interval_sec)
+        tick += 1
         try:
             hedge.accrue_funding()
+            if tick % 5 == 0:   # every ~5 min
+                await hedge.sweep_excess_margin()
         except Exception as e:
             log.exception(f"hedge watcher error: {e}")
