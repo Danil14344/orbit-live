@@ -23,7 +23,7 @@ init_logging("scanner")
 log = get_logger("scanner.main")
 
 from currencies import load_all_currencies, can_transfer, best_withdraw_fee, contracts_match
-from depth import fetch_books_for_opps, evaluate_depth
+from depth import fetch_books_for_opps, evaluate_depth, taker_fee_for
 from executor import Executor, ExecConfig, Mode
 from inventory import InventoryGuard, GuardConfig
 from hedge import HedgeManager, HedgeConfig, hedge_watcher
@@ -53,7 +53,6 @@ PER_EXCHANGE_SUB_CAP = {            # per-exchange subscription limits (WS proto
 
 QUOTE = "USDT"
 MIN_QUOTE_VOLUME = 300_000
-TAKER_FEE = 0.001
 TARGET_POSITION_USD = float(os.getenv("POSITION_USD", "30"))  # match depth-eval size to actual trade size (small-depo: $200 over-rejected thin books)
 SUSPICIOUS_SPREAD_PCT = 5.0
 HARD_MAX_SPREAD_PCT = 200.0
@@ -394,7 +393,7 @@ def find_opportunities(book, currencies_map):
         wfee_quote = wfee_base * ask if wfee_base is not None else None
         wfee_pct = (wfee_quote / TARGET_POSITION_USD * 100) if wfee_quote is not None else None
 
-        net_after_trade = ((bid * (1 - TAKER_FEE)) - (ask * (1 + TAKER_FEE))) / ask * 100
+        net_after_trade = ((bid * (1 - taker_fee_for(sell[0]))) - (ask * (1 + taker_fee_for(buy[0])))) / ask * 100
         net = net_after_trade - (wfee_pct or 0)
         if net <= 0:
             rejected["negative_after_fees"] += 1
@@ -497,7 +496,7 @@ async def _scanner_iter(hub, ex_by_id, currencies_map, executor: Executor, live,
                     book_provider=(hotset.get_book if hotset is not None else None),
                 )
                 for o in top:
-                    d = evaluate_depth(o, books, TARGET_POSITION_USD, TAKER_FEE)
+                    d = evaluate_depth(o, books, TARGET_POSITION_USD)
                     if d is None:
                         rejected["no_depth_data"] += 1
                         continue

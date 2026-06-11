@@ -17,12 +17,12 @@ from currencies import (
     best_withdraw_fee,
     contracts_match,
 )
-from depth import fetch_books_for_opps, evaluate_depth
+from depth import fetch_books_for_opps, evaluate_depth, taker_fee_for, DEFAULT_TAKER_FEE
 
 EXCHANGES = ["mexc", "gate", "kucoin", "bitget", "htx", "bingx", "bitmart"]
 QUOTE = "USDT"
 MIN_QUOTE_VOLUME = 100_000     # 24h volume in USDT, both sides must exceed
-TAKER_FEE = 0.001              # 0.1% per side, refine per-exchange later
+TAKER_FEE = DEFAULT_TAKER_FEE  # per-exchange fees live in depth.TAKER_FEES (mexc 0.05%)
 POSITION_SIZE_USD = 1000       # to convert withdraw fee to %
 SUSPICIOUS_SPREAD_PCT = 5.0    # spreads >= this require contract verification
 HARD_MAX_SPREAD_PCT = 200.0    # spreads above this are always dropped (sanity)
@@ -140,7 +140,7 @@ def find_opportunities(book, currencies_map):
         wfee_pct = (wfee_quote / POSITION_SIZE_USD * 100) if wfee_quote is not None else None
 
         # Net = trade fees both sides + withdraw fee on base
-        net_after_trade = ((bid * (1 - TAKER_FEE)) - (ask * (1 + TAKER_FEE))) / ask * 100
+        net_after_trade = ((bid * (1 - taker_fee_for(sell[0]))) - (ask * (1 + taker_fee_for(buy[0])))) / ask * 100
         net = net_after_trade - (wfee_pct or 0)
         if net <= 0:
             rejected["negative_after_fees"] += 1
@@ -244,7 +244,7 @@ async def main():
                         books = await fetch_books_for_opps(ex_by_id, top_candidates, limit=30)
                         verified_opps = []
                         for o in top_candidates:
-                            d = evaluate_depth(o, books, TARGET_POSITION_USD, TAKER_FEE)
+                            d = evaluate_depth(o, books, TARGET_POSITION_USD)
                             if d is None:
                                 rejected["no_depth_data"] += 1
                                 continue

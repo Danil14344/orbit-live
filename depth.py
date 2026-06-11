@@ -1,5 +1,20 @@
 """Order book depth check — compute VWAP for target position size, filter shallow markets."""
 import asyncio
+import os
+
+# Per-exchange spot taker fees (fraction). MEXC spot taker is 0.05% (maker 0%) —
+# a flat 0.1% overcharged every mexc leg by 0.05pp and hid real edges.
+# Override per venue via env: TAKER_FEE_MEXC=0.0005; default via TAKER_FEE.
+DEFAULT_TAKER_FEE = float(os.getenv("TAKER_FEE", "0.001"))
+TAKER_FEES = {"mexc": 0.0005}
+for _ex in ("mexc", "bingx", "bitget", "bitmart", "kucoin", "gate", "okx", "htx"):
+    _v = os.getenv(f"TAKER_FEE_{_ex.upper()}")
+    if _v:
+        TAKER_FEES[_ex] = float(_v)
+
+
+def taker_fee_for(ex_id: str) -> float:
+    return TAKER_FEES.get(ex_id, DEFAULT_TAKER_FEE)
 
 
 def vwap_buy(asks, target_usd):
@@ -91,7 +106,7 @@ async def fetch_books_for_opps(exchanges_by_id, opps, limit=30,
     return books
 
 
-def evaluate_depth(opp, books, target_usd, taker_fee):
+def evaluate_depth(opp, books, target_usd, taker_fee=None):
     """Recompute net using VWAP for target_usd position.
     Returns updated dict with: vwap_ask, vwap_bid, real_net_pct, max_usd_achievable.
     None if depth insufficient or arbitrage disappears."""
@@ -114,7 +129,9 @@ def evaluate_depth(opp, books, target_usd, taker_fee):
     # Recompute net with VWAP prices
     # buy at vwap_a (pay fee), sell at vwap_b (pay fee), withdraw fee already in opp
     gross_pct = (vwap_b - vwap_a) / vwap_a * 100
-    net_after_trade = ((vwap_b * (1 - taker_fee)) - (vwap_a * (1 + taker_fee))) / vwap_a * 100
+    fee_buy = taker_fee_for(opp["buy_ex"]) if taker_fee is None else taker_fee
+    fee_sell = taker_fee_for(opp["sell_ex"]) if taker_fee is None else taker_fee
+    net_after_trade = ((vwap_b * (1 - fee_sell)) - (vwap_a * (1 + fee_buy))) / vwap_a * 100
     wfee_pct = opp.get("wfee_pct") or 0
     real_net = net_after_trade - wfee_pct
 

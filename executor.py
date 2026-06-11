@@ -589,9 +589,9 @@ class Executor:
             rec.status = "failed"; rec.error = "no vwap data"; return rec
 
         base = position_usd / vwap_a
-        taker = 0.001
-        cost = vwap_a * base * (1 + taker)
-        proceeds = vwap_b * base * (1 - taker)
+        from depth import taker_fee_for
+        cost = vwap_a * base * (1 + taker_fee_for(opp["buy_ex"]))
+        proceeds = vwap_b * base * (1 - taker_fee_for(opp["sell_ex"]))
         wfee_usd = (opp.get("wfee_pct") or 0) / 100 * position_usd
         pnl = proceeds - cost - wfee_usd
 
