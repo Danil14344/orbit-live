@@ -232,6 +232,15 @@ class InventoryGuard:
             if qty <= 0:
                 log.error(f"stop-out: no real {token} balance to sell — skipping market order")
                 return
+            # Dust write-off: below any exchange's min lot a sell can never succeed
+            # (e.g. 0.004 HMSTR vs bitget min 0.1) — retrying forever just spams.
+            # Drop the tracked position and move on.
+            if qty * sell_price < 2.0:
+                log.warning(f"stop-out: {token}@{ex_id} qty={qty} (~${qty * sell_price:.4f}) is dust — written off, no order")
+                self.positions[token] = {"qty": 0.0, "avg_cost": 0.0}
+                self.position_opened_ts.pop(token, None)
+                self.position_peak.pop(token, None)
+                return
             try:
                 log.warning(f"LIVE {reason.upper()}: {token}@{ex_id} qty={qty:.4f} bid={sell_price} avg_cost={avg_cost} loss=${loss_usd:.2f}")
                 await asyncio.wait_for(
@@ -240,6 +249,13 @@ class InventoryGuard:
                 )
                 log.info(f"LIVE {reason.upper()} executed: {token}@{ex_id}")
             except Exception as e:
+                if "minimum amount" in str(e) or "amount of" in str(e):
+                    # Un-sellable on this venue (below min lot) — write off, don't retry
+                    log.warning(f"LIVE {reason.upper()}: {token}@{ex_id} qty={qty} below min lot — written off")
+                    self.positions[token] = {"qty": 0.0, "avg_cost": 0.0}
+                    self.position_opened_ts.pop(token, None)
+                    self.position_peak.pop(token, None)
+                    return
                 log.exception(f"LIVE {reason.upper()} FAILED for {token}@{ex_id}: {e}")
                 self._journal_stop(ex_id, token, qty, sell_price, avg_cost, 0)
                 self.cooldowns[(ex_id, token)] = time.time() + 300
