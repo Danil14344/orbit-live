@@ -72,8 +72,14 @@ class XemmBot:
         # mover the passive quote is systematically picked off and the hedge lands
         # after the move (first live session: 3 fills, all negative, -$0.13).
         self.max_vol_pct = _f("XEMM_MAX_VOL_PCT", "0.3")
+        # After a fill, don't re-quote that side for a while — refilling straight
+        # into the same move is how a trend bleeds a market maker (Hummingbot's
+        # filled_order_delay).
+        self.fill_cooldown_sec = _f("XEMM_FILL_COOLDOWN_SEC", "60")
         # symbol -> side -> {id, price, qty, filled_seen}
         self.orders: dict[str, dict[str, dict]] = {}
+        self.cooldown_until: dict[tuple, float] = {}   # (sym, side) -> ts
+        self._hedging: set = set()                      # (sym, side) in-flight guard
         self.fills = 0
         self.hedges = 0
         self.pnl_usd = 0.0
@@ -210,35 +216,72 @@ class XemmBot:
             log.error(f"[XEMM] hedge {hedge_side} {sym} FAILED: {e} — guard carries exposure")
             return False
 
-    async def _check_fill(self, sym, side):
-        """Poll maker order; hedge any new filled qty. Returns True if order gone."""
+    async def _process_order_update(self, sym, side, od):
+        """Shared fill handler for the ws stream and the poll fallback: hedge any
+        new filled qty, start the post-fill cooldown, drop finished orders."""
         o = self.orders.get(sym, {}).get(side)
-        if not o:
-            return True
-        if o.get("dry"):
-            return False
+        if not o or o.get("dry"):
+            return
+        key = (sym, side)
+        if key in self._hedging:    # ws + poll racing on the same fill
+            return
+        self._hedging.add(key)
+        try:
+            filled = float(od.get("filled") or 0)
+            new = filled - o["filled_seen"]
+            if new * o["price"] >= 1.0:   # hedge in >= $1 chunks
+                self.fills += 1
+                self.cooldown_until[key] = time.time() + self.fill_cooldown_sec
+                ok = await self._hedge(sym, side, new, float(od.get("average") or o["price"]))
+                if ok:
+                    o["filled_seen"] = filled
+            status = (od.get("status") or "").lower()
+            if status in ("closed", "canceled", "cancelled", "expired", "rejected"):
+                # hedge any tail missed above the chunk threshold
+                tail = filled - o["filled_seen"]
+                if tail * o["price"] >= 0.5:
+                    self.cooldown_until[key] = time.time() + self.fill_cooldown_sec
+                    await self._hedge(sym, side, tail, float(od.get("average") or o["price"]))
+                self.orders.get(sym, {}).pop(side, None)
+        finally:
+            self._hedging.discard(key)
+
+    async def _check_fill(self, sym, side):
+        """Poll fallback for the ws fill stream."""
+        o = self.orders.get(sym, {}).get(side)
+        if not o or o.get("dry"):
+            return
         ex = self.ex_by_id[self.maker_id]
         try:
             od = await asyncio.wait_for(ex.fetch_order(o["id"], sym), timeout=10)
         except Exception as e:
             log.debug(f"[XEMM] fetch_order {sym} {side}: {e}")
-            return False
-        filled = float(od.get("filled") or 0)
-        new = filled - o["filled_seen"]
-        if new * o["price"] >= 1.0:   # hedge in >= $1 chunks
-            self.fills += 1
-            ok = await self._hedge(sym, side, new, float(od.get("average") or o["price"]))
-            if ok:
-                o["filled_seen"] = filled
-        status = (od.get("status") or "").lower()
-        if status in ("closed", "canceled", "cancelled", "expired", "rejected"):
-            # hedge any tail missed above $1 threshold
-            tail = filled - o["filled_seen"]
-            if tail * o["price"] >= 0.5:
-                await self._hedge(sym, side, tail, float(od.get("average") or o["price"]))
-            self.orders.get(sym, {}).pop(side, None)
-            return True
-        return False
+            return
+        await self._process_order_update(sym, side, od)
+
+    async def _watch_fills(self):
+        """WS user-data stream on the maker exchange: fills arrive in ~100-300ms
+        instead of the poll's 1-3s — the hedge fires before the move runs away
+        (this latency was the whole adverse-selection loss)."""
+        ex = self.ex_by_id[self.maker_id]
+        if not getattr(ex, "has", {}).get("watchOrders"):
+            log.warning(f"[XEMM] {self.maker_id} lacks watchOrders — poll-only fills")
+            return
+        while True:
+            try:
+                updates = await ex.watch_orders()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                log.warning(f"[XEMM] watch_orders: {str(e)[:100]} — retry in 5s")
+                await asyncio.sleep(5)
+                continue
+            for od in updates or []:
+                sym, oid = od.get("symbol"), od.get("id")
+                for side in ("buy", "sell"):
+                    o = self.orders.get(sym, {}).get(side)
+                    if o and o.get("id") == oid:
+                        await self._process_order_update(sym, side, od)
 
     # ---------- quoting ----------
     async def _tick_symbol(self, token):
@@ -301,9 +344,12 @@ class XemmBot:
             plans.append(("buy", buy_px, qty))
 
         planned_sides = {p[0] for p in plans}
+        now = time.time()
         for side in ("buy", "sell"):
             cur = self.orders.get(sym, {}).get(side)
             plan = next((p for p in plans if p[0] == side), None)
+            if plan is not None and now < self.cooldown_until.get((sym, side), 0):
+                plan = None   # post-fill cooldown: stay out of the book on this side
             if plan is None:
                 if cur:
                     await self._cancel(sym, side)
@@ -320,8 +366,11 @@ class XemmBot:
     async def run(self):
         log.info(f"[XEMM] start maker={self.maker_id} taker={self.taker_id} "
                  f"order=${self.order_usd} min_profit={self.min_profit_pct}% "
-                 f"dry_run={_dry()}")
+                 f"fill_cooldown={self.fill_cooldown_sec:.0f}s dry_run={_dry()}")
         last_summary = time.time()
+        ws_task = None
+        if not _dry():
+            ws_task = asyncio.create_task(self._watch_fills())
         try:
             while True:
                 try:
@@ -341,6 +390,8 @@ class XemmBot:
                 await asyncio.sleep(self.poll_sec)
         finally:
             log.warning("[XEMM] loop exiting — cancelling open maker orders")
+            if ws_task is not None:
+                ws_task.cancel()
             await self.cancel_all()
 
 
