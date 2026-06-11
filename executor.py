@@ -130,6 +130,9 @@ class ExecConfig:
     # Pre-execution sanity check (live only): verify spread still exists via fresh REST
     pre_exec_sanity_check: bool = True   # re-validate spread on fresh book + reprice IOC before firing
     pre_exec_max_decay_pct: float = 0.20
+    # If a ws-sourced pre-exec quote implies a spread this wide, REST-verify it
+    # before trusting (a stale ws feed fakes huge spreads → phantom one-legs).
+    ws_verify_spread_pct: float = 0.8
     # Inventory skewing: tighten threshold when inventory is full, loosen when empty
     inventory_skew_enabled: bool = True
     skew_max_tighten_pct: float = 0.4      # add up to this much to base threshold
@@ -738,6 +741,33 @@ class Executor:
                             fresh_ask = ob["asks"][0][0]
                         else:
                             fresh_bid = ob["bids"][0][0]
+                # Stale-feed guard: a ws quote can lag the real book by 1-3% (mexc
+                # spot feed does this), making the spread look huge when it isn't —
+                # we then reprice onto the phantom price and the leg never crosses
+                # (BTC/VELVET traps). If the ws-implied spread is implausibly wide,
+                # don't trust ws — REST-verify the ws-sourced side(s) against the
+                # live matching engine and use those.
+                ws_spread_pct = (fresh_bid - fresh_ask) / fresh_ask * 100 if fresh_ask else 0
+                verify_thr = getattr(self.cfg, "ws_verify_spread_pct", 0.8)
+                if ws_spread_pct >= verify_thr and (src_buy == "ws" or src_sell == "ws"):
+                    reverify = []
+                    if src_buy == "ws":
+                        reverify.append(("buy", ex_buy))
+                    if src_sell == "ws":
+                        reverify.append(("sell", ex_sell))
+                    obs = await asyncio.gather(*[
+                        asyncio.wait_for(ex.fetch_order_book(sym, limit=5), timeout=2.0)
+                        for _, ex in reverify
+                    ], return_exceptions=True)
+                    for (side, _), ob in zip(reverify, obs):
+                        if isinstance(ob, Exception):
+                            continue
+                        if side == "buy" and ob.get("asks"):
+                            fresh_ask = float(ob["asks"][0][0]); src_buy = "rest-verified"
+                        elif side == "sell" and ob.get("bids"):
+                            fresh_bid = float(ob["bids"][0][0]); src_sell = "rest-verified"
+                    log.info(f"[PRE-EXEC] {sym} ws spread {ws_spread_pct:.2f}% >= {verify_thr}% "
+                             f"— REST-verified -> bid={fresh_bid:.6g} ask={fresh_ask:.6g}")
                 rec.pre_exec_buy_src = src_buy
                 rec.pre_exec_sell_src = src_sell
                 if src_buy == "ws" or src_sell == "ws":
