@@ -381,6 +381,16 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
     to_add = [t for t in target if held_usd(t) < per_token_usd * 0.5]   # under half target => top up
     # drop: held/whitelisted tokens no longer in target, with hysteresis
     candidates_drop = [t for t in current if t not in target_set]
+    # Orphans: tokens actually HELD on the live route that are neither whitelisted
+    # nor targeted — residuals from partial fills and old seeds. Without this they
+    # sit as dead capital forever (WLD did exactly that). Recycle them through the
+    # same grace machinery so spot capital flows token -> USDT -> hot token.
+    for exid in LIVE_ROUTE:
+        for asset, qty in dict(bc.balances.get(exid) or {}).items():
+            if asset == "USDT" or asset in current or asset in target_set:
+                continue
+            if qty * _mark(hub, asset) >= 5.0 and asset not in candidates_drop:
+                candidates_drop.append(asset)
     to_drop = []
     for t in list(off_target_streak.keys()):
         if t not in candidates_drop:
@@ -409,6 +419,16 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
                 except Exception as e:
                     log.error(f"[REBAL] sell {tok}@{exid} failed: {str(e)[:80]}")
         off_target_streak.pop(tok, None)
+
+    # Sells just freed USDT but the 30s-cached balances don't see it yet — refresh
+    # NOW so the buy leg below can spend the proceeds in the SAME pass instead of
+    # stranding the capital until the next one.
+    if to_drop and not dry:
+        try:
+            await bc.refresh_all()
+            total_usdt = sum((bc.available(exid, "USDT") or 0) for exid in LIVE_ROUTE)
+        except Exception as e:
+            log.debug(f"[REBAL] post-sell balance refresh failed: {e}")
 
     # --- BUY adds (respect USDT reserve) ---
     # funded = target tokens we actually hold enough of (don't whitelist a token we
