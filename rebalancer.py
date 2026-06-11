@@ -331,7 +331,7 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
 
     # liquidity-filter candidates until we have cap_tokens
     target = []
-    from executor import BANNED_TOKENS, MAJOR_TOKENS
+    from executor import BANNED_TOKENS, MAJOR_TOKENS, PHANTOM_BANNED_UNTIL
     for tok, stats in ranked:
         if len(target) >= cap_tokens:
             break
@@ -340,6 +340,9 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
             continue
         if tok in MAJOR_TOKENS:
             log.info(f"[REBAL] skip {tok}: major (phantom spread, not real arb)")
+            continue
+        if time.time() < PHANTOM_BANNED_UNTIL.get(tok, 0):
+            log.info(f"[REBAL] skip {tok}: phantom soft-ban (stale-feed strikes)")
             continue
         sym = f"{tok}/USDT"
         ok_all = True

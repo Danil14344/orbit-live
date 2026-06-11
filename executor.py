@@ -46,6 +46,14 @@ MAJOR_TOKENS = {
     ).split(",") if t.strip()
 }
 
+# Phantom-window circuit breaker: tokens whose "spread" is a stale-feed artifact
+# (the sell leg misses by a wide gap every time). Learned at runtime from leg-miss.
+PHANTOM_GAP_PCT = float(os.getenv("PHANTOM_GAP_PCT", "0.8"))     # gap that marks a strike
+PHANTOM_MAX_STRIKES = int(os.getenv("PHANTOM_MAX_STRIKES", "2"))  # strikes before soft-ban
+PHANTOM_BAN_SEC = float(os.getenv("PHANTOM_BAN_SEC", "3600"))     # soft-ban duration
+PHANTOM_STRIKES: dict[str, int] = {}
+PHANTOM_BANNED_UNTIL: dict[str, float] = {}
+
 # Whitelist mode — if non-empty, ONLY these tokens are traded. Others are logged
 # to shadow_opps.jsonl as "would have traded" for later analysis (swap candidates).
 # Loaded from WHITELIST env var (comma-separated bases, e.g. "OPG,ULTIMA,BSB").
@@ -421,6 +429,10 @@ class Executor:
 
         if base in MAJOR_TOKENS:
             return False, f"major (phantom spread) ({base})", 0
+
+        _pban = PHANTOM_BANNED_UNTIL.get(base, 0)
+        if now < _pban:
+            return False, f"phantom soft-ban ({base}, {int(_pban - now)}s)", 0
 
         if (opp["buy_ex"], sym) in API_BANNED_PAIRS or (opp["sell_ex"], sym) in API_BANNED_PAIRS:
             return False, f"api-banned pair ({sym})", 0
@@ -865,6 +877,18 @@ class Executor:
                         miss = lvl < our_px
                     verdict = "price_missed" if miss else "book_moved/size"
                     self.leg_miss[f"{dead_ex.id}:{verdict}"] += 1
+                    # Phantom-window circuit breaker: a price_missed with a gap this
+                    # wide means the SCAN feed was stale (the spread wasn't real) —
+                    # the buy filled, the sell can't cross by 2.7%, and we just
+                    # accumulate one-sided inventory (VELVET trap, 2026-06-11). Count
+                    # strikes per token; soft-ban after a few so we stop seeding it.
+                    if miss and gap >= PHANTOM_GAP_PCT:
+                        _pt = sym.split("/")[0]
+                        PHANTOM_STRIKES[_pt] = PHANTOM_STRIKES.get(_pt, 0) + 1
+                        if PHANTOM_STRIKES[_pt] >= PHANTOM_MAX_STRIKES:
+                            PHANTOM_BANNED_UNTIL[_pt] = time.time() + PHANTOM_BAN_SEC
+                            log.error(f"[PHANTOM] {_pt}: {PHANTOM_STRIKES[_pt]} stale-feed "
+                                      f"strikes (gap {gap:+.2f}%) — soft-banned {PHANTOM_BAN_SEC/60:.0f}min")
                     log.warning(
                         f"[LEG-MISS] {dead_side} {sym}@{dead_ex.id} filled=0 | our_ioc={our_px:.6g} "
                         f"book_top={lvl:.6g} gap={gap:+.3f}% verdict={verdict} "
