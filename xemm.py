@@ -68,6 +68,10 @@ class XemmBot:
         self.reprice_pct = _f("XEMM_REPRICE_PCT", "0.08")
         self.poll_sec = _f("XEMM_POLL_SEC", "2")
         self.max_token_usd = _f("XEMM_MAX_TOKEN_USD", "60")
+        # Don't quote when the symbol's 60s price range exceeds this — on a fast
+        # mover the passive quote is systematically picked off and the hedge lands
+        # after the move (first live session: 3 fills, all negative, -$0.13).
+        self.max_vol_pct = _f("XEMM_MAX_VOL_PCT", "0.3")
         # symbol -> side -> {id, price, qty, filled_seen}
         self.orders: dict[str, dict[str, dict]] = {}
         self.fills = 0
@@ -245,6 +249,15 @@ class XemmBot:
         # poll existing orders first (fills -> hedges)
         for side in ("buy", "sell"):
             await self._check_fill(sym, side)
+
+        # Volatility gate: pull quotes off a fast-moving book entirely.
+        vol = (self.hub.volatility_pct or {}).get(sym, 0.0)
+        if vol > self.max_vol_pct:
+            if self.orders.get(sym):
+                log.info(f"[XEMM] {sym} 60s range {vol:.2f}% > {self.max_vol_pct}% — pulling quotes")
+                for side in ("buy", "sell"):
+                    await self._cancel(sym, side)
+            return
 
         qt = await self._quote(self.taker_id, sym)
         qm = await self._quote(self.maker_id, sym)
