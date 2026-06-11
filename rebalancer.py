@@ -143,28 +143,35 @@ def analyze_shadow(path, lookback_h, min_windows, min_net_pct=0.0, window_gap_se
 
     out = []
     for tok, rows in by_tok.items():
-        ts = sorted(x[0] for x in rows)
+        # The executor trades the TAIL of the distribution, not the median tick:
+        # a token oscillating around 0.1% with frequent 0.4-0.8% bursts is highly
+        # tradeable (VELVET: 5251 above-threshold opps rejected overnight on a low
+        # all-tick median). So gate/count on the rows that actually clear the live
+        # threshold, not on the median of everything.
+        qual = [x for x in rows if x[1] >= min_net_pct]
+        if not qual:
+            continue
+        ts = sorted(x[0] for x in qual)
         windows = 1
         for a, b in zip(ts, ts[1:]):
             if b - a > window_gap_sec:
                 windows += 1
-        nets = [x[1] for x in rows]
-        med_net = statistics.median(nets) if nets else 0.0
-        pnl = sum(x[2] for x in rows)
+        nets = [x[1] for x in qual]
+        med_net = statistics.median(nets)
+        pnl = sum(x[2] for x in qual)
         # Sanity gate: a median "spread" this wide isn't arb — it's a venue where
         # deposits/withdrawals are suspended or the token is being delisted
         # (e.g. BTW showed median 35% net). Never seed these.
         if med_net > max_net_pct:
-            log.warning(f"[REBAL] skip {tok}: median net {med_net:.1f}% > {max_net_pct:.1f}% — "
+            log.warning(f"[REBAL] skip {tok}: qualifying-median net {med_net:.1f}% > {max_net_pct:.1f}% — "
                         f"suspicious (likely suspended transfers/delisting)")
             continue
-        # gate: enough windows AND median net currently clears the live threshold
-        if windows >= min_windows and med_net >= min_net_pct:
-            out.append((tok, {"windows": windows, "trades": len(rows), "pnl": pnl,
-                              "avg_net": sum(nets) / len(nets) if nets else 0,
+        if windows >= min_windows:
+            out.append((tok, {"windows": windows, "trades": len(qual), "pnl": pnl,
+                              "avg_net": sum(nets) / len(nets),
                               "median_net": med_net}))
-    # rank by median net (current edge), then windows
-    out.sort(key=lambda x: (x[1]["median_net"], x[1]["windows"]), reverse=True)
+    # rank by captured-able money (sum of above-threshold would-pnl), then windows
+    out.sort(key=lambda x: (x[1]["pnl"], x[1]["windows"]), reverse=True)
     return out
 
 
