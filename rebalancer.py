@@ -26,6 +26,7 @@ Guardrails:
 import asyncio
 import json
 import os
+import re
 import statistics
 import time
 from collections import defaultdict
@@ -459,18 +460,51 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
     return target_set
 
 
+def _whitelist_reject_counts(executor):
+    """token -> count of 'not in whitelist (TOK)' rejects accumulated by the executor."""
+    out = {}
+    for k, v in getattr(executor, "rejects", {}).items():
+        m = re.match(r"not in whitelist \((\w+)\)", k)
+        if m:
+            out[m.group(1)] = v
+    return out
+
+
 async def rebalance_watcher(executor, hedge, hub, ex_by_id):
-    """Background loop. No-op unless REBALANCE_ENABLED=1. LIVE only."""
+    """Background loop. No-op unless REBALANCE_ENABLED=1. LIVE only.
+
+    Runs a pass every REBALANCE_INTERVAL_MIN, but ALSO fires early when the
+    executor is actively rejecting opportunities for being off-whitelist
+    (REBALANCE_TRIGGER_REJECTS new rejects on one token, default 20) — bursts
+    last minutes; a 30-min cadence sleeps through them."""
     interval = _f("REBALANCE_INTERVAL_MIN", "30") * 60
+    trigger_rejects = _i("REBALANCE_TRIGGER_REJECTS", "20")
+    min_gap = _f("REBALANCE_MIN_GAP_SEC", "120")
     off_target_streak: dict[str, int] = {}
-    log.info(f"rebalancer watcher started (enabled={_enabled()}, dry_run={_dry_run()}, interval={interval/60:.0f}min)")
+    log.info(f"rebalancer watcher started (enabled={_enabled()}, dry_run={_dry_run()}, "
+             f"interval={interval/60:.0f}min, trigger_rejects={trigger_rejects})")
     # small initial delay so balances/tickers are warm
     await asyncio.sleep(60)
+    last_pass = 0.0
+    seen = _whitelist_reject_counts(executor)
     while True:
         try:
-            if _enabled():
+            now = time.time()
+            due = now - last_pass >= interval
+            if not due and now - last_pass >= min_gap:
+                cur = _whitelist_reject_counts(executor)
+                from executor import BANNED_TOKENS
+                for tok, n in cur.items():
+                    if tok not in BANNED_TOKENS and n - seen.get(tok, 0) >= trigger_rejects:
+                        log.info(f"[REBAL] early trigger: {n - seen.get(tok, 0)} new off-whitelist "
+                                 f"rejects on {tok} — running pass now")
+                        due = True
+                        break
+            if due and _enabled():
+                last_pass = now
+                seen = _whitelist_reject_counts(executor)
                 await rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak)
             # else: stay dormant but keep the loop alive so toggling env (on restart) works
         except Exception as e:
             log.exception(f"rebalancer error: {e}")
-        await asyncio.sleep(interval)
+        await asyncio.sleep(30)

@@ -24,7 +24,9 @@ class HedgeConfig:
     funding_rate_8h: float = 0.0001        # 0.01% / 8h average (paper sim)
     state_path: str = "hedge_state.json"
     min_hedge_qty_usd: float = 5.0         # don't bother hedging dust
-    leverage: int = 1                      # always 1x — no liquidation headroom games
+    # 1x default — no liquidation headroom games. HEDGE_LEVERAGE env can raise it
+    # when margin is the binding constraint (isolated; loss capped at posted margin).
+    leverage: int = int(os.getenv("HEDGE_LEVERAGE", "1"))
     # When True, live hedge LOGS the order it would place but does NOT send it.
     # Flip to False (HEDGE_DRY_RUN=0) only after a funded smoke test.
     dry_run: bool = True
@@ -118,23 +120,52 @@ class HedgeManager:
     def can_hedge(self, token: str) -> bool:
         return token in self.perp_symbol
 
-    async def _place(self, side: str, token: str, qty: float, reduce_only: bool):
+    async def _place(self, side: str, token: str, qty: float, reduce_only: bool) -> float:
         """Send (or in dry_run, log) a futures market order. side='sell' opens/grows
-        the short; side='buy' (reduceOnly) closes it. 1x, one-way mode."""
+        the short; side='buy' (reduceOnly) closes it. One-way mode.
+        Returns the qty actually placed (may be < requested when margin caps an open)."""
         sym = self.perp_symbol.get(token)
         if not sym:
             log.warning(f"[HEDGE LIVE] {token}: NO PERP — position is UNHEDGED")
-            return
+            return 0.0
         try:
             amt = float(self.futures.amount_to_precision(sym, qty))
         except Exception:
             amt = qty
         if amt <= 0:
-            return
+            return 0.0
         params = {"reduceOnly": True} if reduce_only else {}
         if self.cfg.dry_run:
             log.info(f"[HEDGE DRY-RUN] would {side} {amt} {sym} reduceOnly={reduce_only} (no order sent)")
-            return
+            return amt
+        # Margin-aware open: cap the order to what free futures USDT can carry,
+        # instead of letting the whole order bounce with "Insufficient margin"
+        # every reconcile pass. Partial hedge > no hedge.
+        if not reduce_only:
+            mark = self._best_mark(token)
+            free = -1.0
+            try:
+                bal = await self.futures.fetch_balance()
+                free = float((bal.get("USDT") or {}).get("free") or 0)
+            except Exception as e:
+                log.debug(f"[HEDGE] fetch_balance for margin cap: {e}")
+            if free >= 0 and mark > 0:
+                max_amt = free * 0.95 * self.cfg.leverage / mark
+                if amt > max_amt:
+                    if max_amt * mark < self.cfg.min_hedge_qty_usd:
+                        if time.time() >= getattr(self, "_margin_mute_until", 0):
+                            log.error(f"[HEDGE LIVE] no margin for {sym}: need ~${amt * mark / self.cfg.leverage:.0f}, "
+                                      f"free=${free:.0f} — UNDER-HEDGED (muted 10min)")
+                            self._margin_mute_until = time.time() + 600
+                        return 0.0
+                    log.warning(f"[HEDGE LIVE] margin cap {sym}: {amt:.4f} -> {max_amt:.4f} "
+                                f"(free=${free:.0f}, {self.cfg.leverage}x) — PARTIAL hedge")
+                    try:
+                        amt = float(self.futures.amount_to_precision(sym, max_amt))
+                    except Exception:
+                        amt = max_amt
+                    if amt <= 0:
+                        return 0.0
         # Force 1x leverage once per symbol, right before the first real order.
         # bingx requires a `side` arg on setLeverage; in one-way mode it's BOTH.
         # Without it the call errors and the symbol keeps the exchange default (e.g.

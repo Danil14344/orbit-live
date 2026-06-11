@@ -404,21 +404,32 @@ class Executor:
             return False, f"banned token ({base})", 0
 
         if WHITELIST_TOKENS and base not in WHITELIST_TOKENS:
-            # Shadow-log this would-have-traded opp for later analysis
-            try:
-                import json as _json
-                rec = {
-                    "ts": time.time(), "token": base, "symbol": sym,
-                    "buy_ex": opp["buy_ex"], "sell_ex": opp["sell_ex"],
-                    "real_net_pct": opp.get("real_net_pct", 0),
-                    "would_pnl_usd": position * opp.get("real_net_pct", 0) / 100,
-                    "depth_usd": opp.get("max_usd_achievable", 0),
-                }
-                with open(SHADOW_LOG_PATH, "a") as _f:
-                    _f.write(_json.dumps(rec) + "\n")
-            except Exception:
-                pass
-            return False, f"not in whitelist ({base})", 0
+            # The whitelist is a FUNDING policy (what the rebalancer seeds), not a
+            # trade gate. If we already hold enough of the token on the sell side
+            # (residuals, dropped-from-whitelist inventory), trade it anyway —
+            # overnight 2026-06-11 the bot held $25 VELVET and rejected 5251
+            # above-threshold VELVET opps purely on whitelist membership.
+            inventory_backed = False
+            if self.cfg.mode == Mode.LIVE and self.balance_cache is not None:
+                have = self.balance_cache.available(opp["sell_ex"], base) or 0
+                need = position / opp["vwap_ask"] if opp.get("vwap_ask") else 0
+                inventory_backed = need > 0 and have >= need
+            if not inventory_backed:
+                # Shadow-log this would-have-traded opp for later analysis
+                try:
+                    import json as _json
+                    rec = {
+                        "ts": time.time(), "token": base, "symbol": sym,
+                        "buy_ex": opp["buy_ex"], "sell_ex": opp["sell_ex"],
+                        "real_net_pct": opp.get("real_net_pct", 0),
+                        "would_pnl_usd": position * opp.get("real_net_pct", 0) / 100,
+                        "depth_usd": opp.get("max_usd_achievable", 0),
+                    }
+                    with open(SHADOW_LOG_PATH, "a") as _f:
+                        _f.write(_json.dumps(rec) + "\n")
+                except Exception:
+                    pass
+                return False, f"not in whitelist ({base})", 0
 
         if self.guard is not None and self.guard.is_blacklisted(opp["buy_ex"], base):
             return False, "token blacklisted (recent stop-loss)", 0
