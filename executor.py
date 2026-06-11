@@ -175,6 +175,7 @@ class Executor:
         self.considered: int = 0
         # ---- leg-risk telemetry ----
         self.outcomes: dict[str, int] = defaultdict(int)   # rec.status -> count
+        self.leg_miss: dict[str, int] = defaultdict(int)   # leg-miss verdict -> count
         self.slip_sum: float = 0.0    # sum(expected_net_pct - actual_net_pct) over filled trades
         self.slip_n: int = 0          # count of filled trades measured
         self.preexec_ws_hits: int = 0   # pre-exec legs served from a fresh ws quote
@@ -252,11 +253,13 @@ class Executor:
                   if k not in ("ok", "aborted_spread_decayed", "aborted_sanity_check")}
         others_top = ", ".join(f"{k}:{v}" for k, v in sorted(others.items(), key=lambda x: -x[1])[:4])
         rej_top = ", ".join(f"{k}:{v}" for k, v in sorted(self.rejects.items(), key=lambda x: -x[1])[:5])
+        miss_top = ", ".join(f"{k}:{v}" for k, v in sorted(self.leg_miss.items(), key=lambda x: -x[1]))
         return (
             f"[LEG-RISK] n={tot} ok={ok}({pct(ok)}) decay={decay}({pct(decay)}) "
             f"sanity_abort={sanity}({pct(sanity)}) one_legged={one_leg}({pct(one_leg)}) "
             f"avg_slip={avg_slip:+.3f}% ws_preexec={ws_rate:.0f}% ({self.preexec_ws_hits}/{self.preexec_legs})"
             + (f" | {others_top}" if others_top else "")
+            + (f" | leg_miss[{miss_top}]" if miss_top else "")
             + f" || considered={self.considered} rej:[{rej_top}]"
         )
 
@@ -828,6 +831,34 @@ class Executor:
                 f"SELL@{opp['sell_ex']} filled={sell_filled:.4f} avg={sell_price:.6g} | "
                 f"net_qty={base:.4f} pnl=${proc - cost:.4f}"
             )
+            # One-legged diagnostic: both orders ACCEPTED but one returned filled=0
+            # (its IOC didn't cross). Snapshot the live book on the dead side to see
+            # whether our price missed, the size was too deep, or the book vanished —
+            # this is the dominant loss mode (75% of attempts) and we were blind to why.
+            if (buy_filled <= 0) != (sell_filled <= 0):
+                dead_ex = ex_buy if buy_filled <= 0 else ex_sell
+                dead_side = "BUY" if buy_filled <= 0 else "SELL"
+                our_px = ioc_buy_price if buy_filled <= 0 else ioc_sell_price
+                try:
+                    ob = await asyncio.wait_for(dead_ex.fetch_order_book(sym, limit=5), timeout=2.0)
+                    if dead_side == "BUY":
+                        lvl = ob["asks"][0][0] if ob.get("asks") else 0   # need ask <= our bid
+                        gap = (lvl / our_px - 1) * 100 if our_px else 0
+                        miss = lvl > our_px
+                    else:
+                        lvl = ob["bids"][0][0] if ob.get("bids") else 0   # need bid >= our ask
+                        gap = (our_px / lvl - 1) * 100 if lvl else 0
+                        miss = lvl < our_px
+                    verdict = "price_missed" if miss else "book_moved/size"
+                    self.leg_miss[f"{dead_ex.id}:{verdict}"] += 1
+                    log.warning(
+                        f"[LEG-MISS] {dead_side} {sym}@{dead_ex.id} filled=0 | our_ioc={our_px:.6g} "
+                        f"book_top={lvl:.6g} gap={gap:+.3f}% verdict={verdict} "
+                        f"| opp_age={rec.opp_age_ms:.0f}ms buf={buf:.3f}%"
+                    )
+                except Exception as e:
+                    self.leg_miss[f"{dead_ex.id}:unknown"] += 1
+                    log.warning(f"[LEG-MISS] {dead_side} {sym}@{dead_ex.id} filled=0 (book fetch failed: {str(e)[:50]})")
             token = sym.split("/")[0]
             # Record ACTUAL per-leg fills (not just the matched base) so inventory tracks
             # reality even when the legs fill asymmetrically.
