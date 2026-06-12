@@ -476,9 +476,17 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
             if (total_usdt - spent - need) < reserve_floor:
                 log.info(f"[REBAL] skip buy {tok}@{exid}: would breach USDT reserve")
                 continue
+            # Seed with what's actually here instead of all-or-nothing: a $1 USDT
+            # shortfall on bitget left XPL unseeded on its SELL venue and cost 76
+            # above-threshold windows (2026-06-12). Partial inventory still trades —
+            # the executor shrinks position size to the sell-side balance.
             if usdt_here < need * 1.02:
-                log.info(f"[REBAL] skip buy {tok}@{exid}: USDT here ${usdt_here:.0f} < need ${need:.0f}")
-                continue
+                affordable = usdt_here * 0.98
+                if affordable < 5.0:
+                    log.info(f"[REBAL] skip buy {tok}@{exid}: USDT here ${usdt_here:.0f} < need ${need:.0f}")
+                    continue
+                log.info(f"[REBAL] partial seed {tok}@{exid}: ${affordable:.0f} of ${need:.0f} (all USDT here)")
+                need = affordable
             try:
                 got = await _buy(ex, sym, need, slip_cap, dry)
                 spent += got
