@@ -626,6 +626,10 @@ async def hedge_reconcile_loop(executor, hedge, interval_sec=60):
             # spuriously close real hedges. Require a recent refresh for every venue.
             cache_warm = bc is not None and all((now - bc.last_update.get(e, 0)) < 90 for e in exids)
             if cache_warm:
+                # Self-heal tracked shorts from the real exchange positions before
+                # deciding targets — prevents a phantom (margin-capped) short from
+                # making the loop think a naked spot is already hedged.
+                await hedge.sync_shorts_to_real()
                 # Check every hedgeable token we hold (whitelist) OR already short.
                 tokens = set(WHITELIST_TOKENS) | {t for t, s in hedge.shorts.items() if s["qty"] > 0}
                 for token in tokens:
@@ -640,6 +644,65 @@ async def hedge_reconcile_loop(executor, hedge, interval_sec=60):
                     await hedge.adjust(token, target, mark)
         except Exception as e:
             hl.warning(f"hedge reconcile failed: {type(e).__name__}: {str(e)[:90]}")
+        await asyncio.sleep(interval_sec)
+
+
+async def live_drawdown_monitor(executor, hedge, hub, interval_sec=60):
+    """LIVE portfolio kill-switch. The executor's MTM drawdown stop only runs in
+    PAPER (it needs virtual_portfolio); live mode had NO portfolio-level loss limit,
+    so open-inventory / hedge drift could bleed unbounded with zero trades. This
+    computes real equity (spot + futures wallet + hedge uPnL) and pauses ALL trading
+    if it drops > DRAWDOWN_PCT_STOP from the daily start."""
+    dl = get_logger("drawdown")
+    if executor.cfg.mode != Mode.LIVE:
+        return
+    bc = executor.balance_cache
+    if bc is None:
+        dl.info("live drawdown monitor: no balance cache — not running")
+        return
+    stop_pct = float(os.getenv("DAILY_DRAWDOWN_PCT_STOP",
+                               str(getattr(executor.cfg, "daily_drawdown_pct_stop", 10.0))))
+    start_equity = None
+    day_anchor = time.time()
+    await asyncio.sleep(90)   # warm up balances/marks
+    dl.info(f"live drawdown monitor started (stop={stop_pct:.0f}%, interval={interval_sec}s)")
+    while True:
+        try:
+            # futures wallet USDT (margin not counted in spot)
+            fut = 0.0
+            if hedge is not None and getattr(hedge, "futures", None) is not None and not hedge.cfg.dry_run:
+                try:
+                    fb = await hedge.futures.fetch_balance()
+                    fut = float((fb.get("total") or {}).get("USDT") or 0)
+                except Exception:
+                    fut = 0.0
+            spot = bc.total_usdt_value(hub) if hub is not None else 0.0
+            upnl = hedge.unrealized_pnl_usd() if hedge is not None else 0.0
+            equity = spot + fut + upnl
+            now = time.time()
+            # daily reset
+            if now - day_anchor >= 86400:
+                start_equity = equity
+                day_anchor = now
+            if start_equity is None or start_equity <= 0:
+                if equity > 0:
+                    start_equity = equity
+                    dl.info(f"drawdown baseline set: equity=${equity:.2f}")
+            elif equity > 0:
+                dd = (1 - equity / start_equity) * 100
+                if dd >= stop_pct and now >= executor.paused_until:
+                    executor.paused_until = now + 6 * 3600
+                    msg = (f"LIVE DRAWDOWN STOP: equity ${equity:.2f} vs start ${start_equity:.2f} "
+                           f"(-{dd:.1f}% >= {stop_pct:.0f}%) — trading PAUSED 6h")
+                    dl.error(msg)
+                    notifier = getattr(executor, "notifier", None)
+                    if notifier is not None:
+                        try:
+                            await notifier.broadcast(f"🛑 {msg}")
+                        except Exception:
+                            pass
+        except Exception as e:
+            dl.warning(f"drawdown monitor error: {str(e)[:90]}")
         await asyncio.sleep(interval_sec)
 
 
@@ -880,6 +943,7 @@ async def main():
     feeders.append(asyncio.create_task(health_monitor(executor, interval_sec=600)))
     feeders.append(asyncio.create_task(state_backup_loop(interval_sec=3600, keep=72)))
     feeders.append(asyncio.create_task(hedge_reconcile_loop(executor, hedge, interval_sec=60)))
+    feeders.append(asyncio.create_task(live_drawdown_monitor(executor, hedge, hub, interval_sec=60)))
 
     # Telegram control & monitoring bot (optional — enabled via TELEGRAM_BOT_TOKEN)
     if os.getenv("TELEGRAM_BOT_TOKEN"):

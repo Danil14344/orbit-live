@@ -680,7 +680,8 @@ class Executor:
             self.bidir.record(token, opp["buy_ex"], opp["sell_ex"])
         if self.virtual_portfolio is not None:
             self.virtual_portfolio.apply_trade(
-                opp["buy_ex"], opp["sell_ex"], token, position_usd, base, vwap_a, vwap_b, taker
+                opp["buy_ex"], opp["sell_ex"], token, position_usd, base, vwap_a, vwap_b,
+                taker_fee_for(opp["buy_ex"])
             )
         return rec
 
@@ -1001,6 +1002,8 @@ class Executor:
         def _fill_price(res, fallback=0.0):
             return float(res.get("average") or res.get("price") or fallback) if res else fallback
 
+        from depth import taker_fee_for
+        realized = 0.0   # actual realized cash PnL on this attempt (0 if nothing filled)
         if buy_ok and not sell_ok:
             filled, buy_price = await _reconcile(ex_buy, buy_res)
             if buy_price <= 0:
@@ -1025,10 +1028,13 @@ class Executor:
                         ex_buy.create_market_sell_order(sym, close_qty),
                         timeout=self.cfg.order_timeout_sec,
                     )
+                    cf = _fill_qty(close_res) or close_qty
+                    cp = _fill_price(close_res, buy_price)
                     if self.guard is not None:
-                        self.guard.on_fill(opp["buy_ex"], token, "sell",
-                                           _fill_qty(close_res) or close_qty,
-                                           _fill_price(close_res, buy_price))
+                        self.guard.on_fill(opp["buy_ex"], token, "sell", cf, cp)
+                    # Real PnL: bought `filled`@buy_price, sold `cf`@cp, both taker.
+                    fee = taker_fee_for(opp["buy_ex"])
+                    realized = cp * cf * (1 - fee) - buy_price * filled * (1 + fee)
                     rec.status = "hedged_sell_failed"
                 else:
                     rec.status = "buy_only_unfilled"
@@ -1036,6 +1042,8 @@ class Executor:
                 rec.status = "hedge_failed"
                 rec.error = f"sell_err={sell_res}; hedge_err={e}"
                 log.error(f"[HEDGE FAIL] {sym}: {e} — holding {filled:.4f} {token}, guard will unwind")
+                # Open leg still held → loss is unrealized; guard's stop-loss books it
+                # if/when it unwinds. Don't fabricate a number into daily PnL here.
             else:
                 rec.error = f"sell_err={sell_res}"
         elif sell_ok and not buy_ok:
@@ -1054,10 +1062,13 @@ class Executor:
                         ex_sell.create_order(sym, "limit", "buy", filled, _px, {"timeInForce": "IOC"}),
                         timeout=self.cfg.order_timeout_sec,
                     )
+                    cf = _fill_qty(close_res) or filled
+                    cp = _fill_price(close_res, sell_price)
                     if self.guard is not None:
-                        self.guard.on_fill(opp["sell_ex"], token, "buy",
-                                           _fill_qty(close_res) or filled,
-                                           _fill_price(close_res, sell_price))
+                        self.guard.on_fill(opp["sell_ex"], token, "buy", cf, cp)
+                    # Real PnL: sold `filled`@sell_price, bought back `cf`@cp, both taker.
+                    fee = taker_fee_for(opp["sell_ex"])
+                    realized = sell_price * filled * (1 - fee) - cp * cf * (1 + fee)
                     rec.status = "hedged_buy_failed"
                 else:
                     rec.status = "sell_only_unfilled"
@@ -1072,7 +1083,8 @@ class Executor:
             rec.error = f"buy={buy_res}; sell={sell_res}"
             log.error(f"[BOTH FAILED] {sym}")
 
-        # Rough loss estimate for hedged cases — taker fee × 2
-        rec.actual_pnl_usd = -position_usd * 0.002 if "hedged" in rec.status else -0.5
-        rec.actual_net_pct = rec.actual_pnl_usd / position_usd * 100
+        # Use the REAL realized cash flow (0 when nothing filled or loss is still
+        # unrealized in inventory). No more fabricated -$0.5 / -0.2% polluting PnL.
+        rec.actual_pnl_usd = realized
+        rec.actual_net_pct = (realized / position_usd * 100) if position_usd else 0.0
         return rec

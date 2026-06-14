@@ -10,8 +10,11 @@ Features:
   - Balances: free balances per exchange (from the live RealBalanceCache, or a
     fresh fetch_balance() fallback in paper mode).
 
-Auth: only chat_ids in TELEGRAM_CHAT_ID may use the bot. If that var is empty,
-the first user to /start binds themselves (persisted to .telegram_chats.json).
+Auth: PUBLIC bot — anyone may /start and use the customer commands (login,
+subscription, payments, Cabinet), each with their own per-chat account session.
+`TELEGRAM_CHAT_ID` (or the first /start when empty, persisted to
+.telegram_chats.json) marks the OPERATOR chat(s) — the only ones allowed to run
+owner telemetry (/balances /status /pnl) and to receive trade notifications.
 
 Subscription commands talk to the Eye Crypt backend with the *account* JWT
 (from POST /v1/login with email+password), which is separate from the bot's
@@ -40,11 +43,17 @@ from pathlib import Path
 import httpx
 
 from logsetup import get_logger
+from appdir import BASE_DIR
 
 log = get_logger("telegram")
 
-_CHATS_FILE = Path(__file__).parent / ".telegram_chats.json"
-_SESSION_FILE = Path(__file__).parent / ".eyecrypt_session.json"
+# Resolve against the stable app home (folder of the .exe when frozen). Using
+# Path(__file__).parent breaks in a PyInstaller build — it points into a per-process
+# _MEIPASS temp dir that's wiped on exit, so the operator binding and the entered
+# license key would not survive a restart.
+_CHATS_FILE = BASE_DIR / ".telegram_chats.json"
+_SESSION_FILE = BASE_DIR / ".eyecrypt_session.json"
+_LICENSE_FILE = BASE_DIR / ".telegram_licenses.json"
 
 # ── brand (Eye Crypt) ──
 EYE = "👁"
@@ -79,16 +88,32 @@ class TelegramBot:
         self.api_base = os.getenv("EYECRYPT_API", "https://api.eyecryptbot.com").rstrip("/")
         self.miniapp_url = os.getenv("TELEGRAM_MINIAPP_URL", "").strip().rstrip("/") or None
         self._miniapp_pinned = self.miniapp_url is not None  # explicit env wins; don't override
-        self.account_token = os.getenv("EYECRYPT_ACCOUNT_TOKEN", "").strip() or None
-        if self.account_token is None and _SESSION_FILE.exists():
+        # Per-chat account sessions (public multi-user bot): each Telegram chat has its
+        # own backend JWT so customers never see each other's account. The env token is
+        # an operator-only fallback used when an owner chat hasn't done /login.
+        self._env_account_token = os.getenv("EYECRYPT_ACCOUNT_TOKEN", "").strip() or None
+        self.account_tokens: dict[int, str] = {}
+        self._legacy_token: str | None = None
+        if _SESSION_FILE.exists():
             try:
-                self.account_token = json.loads(_SESSION_FILE.read_text()).get("access_token")
+                raw = json.loads(_SESSION_FILE.read_text())
+                if isinstance(raw.get("tokens"), dict):
+                    self.account_tokens = {int(k): v for k, v in raw["tokens"].items() if v}
+                elif raw.get("access_token"):
+                    # migrate old single-session file → operator fallback
+                    self._legacy_token = raw["access_token"]
             except Exception:
                 pass
         self._offset = 0
         self._client: httpx.AsyncClient | None = None
         self.authorized: set[int] = set()
         self._load_chats()
+        # Per-chat subscription licenses (public bot, single instance per subscriber):
+        # a chat unlocks the owner menu only after entering a valid license key, which
+        # is verified against the backend (GET /v1/verify). {chat_id: {key, tier, expires_at}}
+        self.licensed: dict[int, dict] = {}
+        self._awaiting_key: set[int] = set()
+        self._load_licenses()
 
     @property
     def enabled(self) -> bool:
@@ -122,6 +147,82 @@ class TelegramBot:
 
     def _is_authorized(self, chat_id: int) -> bool:
         return chat_id in self.authorized
+
+    # ---------- subscription license gate ----------
+    def _load_licenses(self):
+        if not _LICENSE_FILE.exists():
+            return
+        try:
+            raw = json.loads(_LICENSE_FILE.read_text())
+            self.licensed = {int(k): v for k, v in raw.items() if isinstance(v, dict) and v.get("key")}
+        except Exception as e:
+            log.warning(f"could not read {_LICENSE_FILE.name}: {e}")
+
+    def _persist_licenses(self):
+        try:
+            _LICENSE_FILE.write_text(json.dumps({str(k): v for k, v in self.licensed.items()}))
+        except Exception as e:
+            log.warning(f"could not persist licenses: {e}")
+
+    def _has_access(self, chat_id: int) -> bool:
+        """Full (owner) access: a pre-authorized operator chat, or a chat that has
+        entered a valid subscription license key."""
+        return chat_id in self.authorized or chat_id in self.licensed
+
+    async def _verify_license(self, key: str) -> dict | None:
+        """Validate a license key against the backend. Returns the verify payload
+        ({valid, tier, expires_at}) on success, else None."""
+        import license as lic
+        headers = {"Authorization": f"Bearer {key}", "X-Device-Id": lic._device_id()}
+        try:
+            assert self._client is not None
+            r = await self._client.get(f"{self.api_base}/v1/verify", headers=headers)
+            if r.status_code == 200:
+                d = r.json()
+                if d.get("valid"):
+                    return d
+            return None
+        except Exception as e:
+            log.warning(f"license verify failed: {e}")
+            return None
+
+    def _sub_line(self, chat_id: int) -> str | None:
+        """One-line subscription summary from the chat's verified license, if any."""
+        lic = self.licensed.get(chat_id)
+        if not lic:
+            return None
+        exp = lic.get("expires_at")
+        days = ""
+        try:
+            if exp:
+                from datetime import datetime, timezone
+                dt = datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
+                left = (dt - datetime.now(timezone.utc)).days
+                days = f" · осталось {left} дн."
+        except Exception:
+            pass
+        return f"подписка: тариф {lic.get('tier', '?')}{days} · до {html.escape(str(exp or '?'))}"
+
+    async def _cmd_key(self, chat_id: int, key: str):
+        key = (key or "").strip()
+        self._awaiting_key.discard(chat_id)
+        if not key:
+            await self.send(chat_id, "Пришлите ключ лицензии одним сообщением, или: /key <ключ>")
+            self._awaiting_key.add(chat_id)
+            return
+        d = await self._verify_license(key)
+        if d is None:
+            await self.send(chat_id, "❌ Ключ недействителен или подписка неактивна.\n"
+                                     "Проверьте ключ в кабинете eyecryptbot.com и пришлите ещё раз.")
+            self._awaiting_key.add(chat_id)
+            return
+        self.licensed[chat_id] = {"key": key, "tier": d.get("tier"), "expires_at": d.get("expires_at")}
+        self.authorized.add(chat_id)  # receive trade notifications for this instance
+        self._persist_licenses()
+        log.info(f"license unlocked chat_id={chat_id} tier={d.get('tier')}")
+        sub = self._sub_line(chat_id)
+        await self.send(chat_id, f"{_h('доступ открыт ✅')}\n{sub or ''}\n\n{self._help_text(True)}",
+                        self._main_keyboard(True))
 
     # ---------- Telegram transport ----------
     async def _api_call(self, method: str, **params):
@@ -196,25 +297,39 @@ class TelegramBot:
         await self.broadcast(text)
 
     # ---------- command handlers ----------
-    def _main_keyboard(self):
-        return [["/balances", "/status"], ["/pnl", "/sub"]]
+    def _main_keyboard(self, is_owner: bool = False):
+        if is_owner:
+            return [["/balances", "/status"], ["/pnl", "/sub"]]
+        return [["/key", "/help"], ["/sub", "/renew"]]
 
-    async def _cmd_start(self, chat_id: int, just_bound: bool):
+    async def _cmd_start(self, chat_id: int, just_bound: bool, is_owner: bool = False):
+        # Locked: no operator binding and no verified license — ask for the key first.
+        if not is_owner:
+            self._awaiting_key.add(chat_id)
+            text = (f"{_h('добро пожаловать')}\n"
+                    "Чтобы пользоваться ботом, введите ключ лицензии вашей подписки.\n\n"
+                    "Пришлите ключ одним сообщением или командой:\n"
+                    "<code>/key &lt;ваш-ключ&gt;</code>\n\n"
+                    "Ключ — в личном кабинете на eyecryptbot.com.")
+            await self.send(chat_id, text, [["/key", "/help"]])
+            return
         hello = "чат привязан ✅" if just_bound else "бот на связи"
-        text = f"{_h(hello)}\n{self._help_text()}"
+        text = f"{_h(hello)}\n{self._help_text(is_owner)}"
         cabinet = self._cabinet_button()
         if cabinet is not None:
             await self.send(chat_id, text, inline=cabinet)
-            await self.send(chat_id, "Меню ниже 👇", self._main_keyboard())
+            await self.send(chat_id, "Меню ниже 👇", self._main_keyboard(is_owner))
         else:
-            await self.send(chat_id, text, self._main_keyboard())
+            await self.send(chat_id, text, self._main_keyboard(is_owner))
 
-    def _help_text(self) -> str:
+    def _help_text(self, is_owner: bool = False) -> str:
+        owner_cmds = ("/balances — балансы по всем биржам\n"
+                      "/balance &lt;биржа&gt; — балансы одной биржи\n"
+                      "/status — статус бота (режим, сделки, активные)\n"
+                      "/pnl — дневной PnL и винрейт\n") if is_owner else ""
         return ("<b>Команды</b>\n"
-                "/balances — балансы по всем биржам\n"
-                "/balance &lt;биржа&gt; — балансы одной биржи\n"
-                "/status — статус бота (режим, сделки, активные)\n"
-                "/pnl — дневной PnL и винрейт\n"
+                "/key &lt;ключ&gt; — ввести ключ лицензии подписки\n"
+                + owner_cmds +
                 "/login &lt;email&gt; &lt;пароль&gt; [totp] — вход в аккаунт\n"
                 "/sub — статус подписки\n"
                 "/renew — реквизиты для продления\n"
@@ -296,6 +411,9 @@ class TelegramBot:
             if vp is not None and self.hub is not None:
                 lines.append(f"\n<b>MTM: {_fmt_usd(vp.total_value_usd(self.hub))}</b>")
 
+        sub = self._sub_line(chat_id)
+        if sub:
+            lines.append(f"\n{DIV}\n{sub}")
         if not lines:
             await self.send(chat_id, f"{_h('балансы')}\nНедоступны (кэш ещё не заполнен или биржи не подключены).")
             return
@@ -335,14 +453,22 @@ class TelegramBot:
         await self.send(chat_id, text, inline=self._cabinet_button())
 
     # ---------- subscription (backend API, account JWT) ----------
-    def _account_headers(self):
-        if not self.account_token:
-            return None
-        return {"Authorization": f"Bearer {self.account_token}"}
+    def _token_for(self, chat_id: int) -> str | None:
+        t = self.account_tokens.get(chat_id)
+        if t:
+            return t
+        # operator may rely on the env/legacy token without an explicit /login
+        if self._is_authorized(chat_id):
+            return self._env_account_token or self._legacy_token
+        return None
+
+    def _account_headers(self, chat_id: int):
+        t = self._token_for(chat_id)
+        return {"Authorization": f"Bearer {t}"} if t else None
 
     def _persist_session(self):
         try:
-            _SESSION_FILE.write_text(json.dumps({"access_token": self.account_token}))
+            _SESSION_FILE.write_text(json.dumps({"tokens": {str(k): v for k, v in self.account_tokens.items()}}))
         except Exception as e:
             log.warning(f"could not persist session: {e}")
 
@@ -360,9 +486,9 @@ class TelegramBot:
                 r = await cli.post(f"{self.api_base}/v1/login", json=body)
             data = r.json() if r.content else {}
             if r.status_code == 200 and data.get("access_token"):
-                self.account_token = data["access_token"]
+                self.account_tokens[chat_id] = data["access_token"]
                 self._persist_session()
-                await self.send(chat_id, "Вход выполнен ✅", self._main_keyboard())
+                await self.send(chat_id, "Вход выполнен ✅", self._main_keyboard(self._is_authorized(chat_id)))
             elif data.get("detail") == "totp_required":
                 await self.send(chat_id, "Нужен код 2FA: /login <email> <пароль> <totp>")
             else:
@@ -371,15 +497,14 @@ class TelegramBot:
             await self.send(chat_id, f"Вход недоступен: {html.escape(str(e)[:120])}")
 
     async def _cmd_logout(self, chat_id: int):
-        self.account_token = None
-        try:
-            _SESSION_FILE.unlink(missing_ok=True)
-        except Exception:
-            pass
+        self.account_tokens.pop(chat_id, None)
+        if self._is_authorized(chat_id):
+            self._legacy_token = None  # operator clearing the migrated session
+        self._persist_session()
         await self.send(chat_id, "Выход выполнен.")
 
     async def _need_login(self, chat_id: int) -> bool:
-        if self._account_headers() is None:
+        if self._account_headers(chat_id) is None:
             await self.send(chat_id, "Сначала войдите в аккаунт: /login <email> <пароль> [totp]")
             return True
         return False
@@ -389,7 +514,7 @@ class TelegramBot:
             return
         try:
             async with httpx.AsyncClient(timeout=10) as cli:
-                r = await cli.get(f"{self.api_base}/v1/me/subscription", headers=self._account_headers())
+                r = await cli.get(f"{self.api_base}/v1/me/subscription", headers=self._account_headers(chat_id))
             if r.status_code == 401:
                 await self.send(chat_id, "Сессия истекла. Войдите снова: /login")
                 return
@@ -399,7 +524,7 @@ class TelegramBot:
             d = r.json()
             if not d:
                 await self.send(chat_id, "Активной подписки нет. /renew — оформить.",
-                                [["/renew"], ["/balances", "/status"]])
+                                [["/renew", "/login"], ["/help"]])
                 return
             active = "активна ✅" if d.get("is_active") else "истекла ❌"
             text = (f"{_h('подписка')}\n"
@@ -407,7 +532,7 @@ class TelegramBot:
                     f"тариф: {d.get('tier', '?')}\n"
                     f"осталось дней: {d.get('days_left', '?')}\n"
                     f"действует до: {html.escape(str(d.get('expires_at', '?')))}")
-            await self.send(chat_id, text, [["/renew", "/cancel"], ["/balances", "/status"]])
+            await self.send(chat_id, text, [["/renew", "/cancel"], ["/sub", "/help"]])
         except Exception as e:
             await self.send(chat_id, f"Подписка недоступна: {html.escape(str(e)[:120])}")
 
@@ -416,7 +541,7 @@ class TelegramBot:
             return
         try:
             async with httpx.AsyncClient(timeout=10) as cli:
-                r = await cli.get(f"{self.api_base}/v1/payments/wallet", headers=self._account_headers())
+                r = await cli.get(f"{self.api_base}/v1/payments/wallet", headers=self._account_headers(chat_id))
             d = r.json() if r.status_code == 200 else {}
         except Exception as e:
             await self.send(chat_id, f"Реквизиты недоступны: {html.escape(str(e)[:120])}")
@@ -441,7 +566,7 @@ class TelegramBot:
         try:
             async with httpx.AsyncClient(timeout=30) as cli:
                 r = await cli.post(f"{self.api_base}/v1/payments/submit",
-                                   headers=self._account_headers(), json=body)
+                                   headers=self._account_headers(chat_id), json=body)
             data = r.json() if r.content else {}
             if r.status_code == 200:
                 await self.send(chat_id, f"Платёж подтверждён ✅ статус: {html.escape(str(data.get('status', 'confirmed')))}.\n"
@@ -459,7 +584,7 @@ class TelegramBot:
         try:
             async with httpx.AsyncClient(timeout=15) as cli:
                 r = await cli.post(f"{self.api_base}/v1/me/cancel-subscription",
-                                   headers=self._account_headers(), json={})
+                                   headers=self._account_headers(chat_id), json={})
             data = r.json() if r.content else {}
             if r.status_code == 200:
                 until = html.escape(str(data.get("active_until", "")))
@@ -481,28 +606,37 @@ class TelegramBot:
         if chat_id is None or not text:
             return
 
-        just_bound = False
-        if not self._is_authorized(chat_id):
-            # Self-bind only when nobody is configured yet.
-            if not self.authorized and text.split()[0].split("@")[0] == "/start":
-                self.authorized.add(chat_id)
-                self._persist_chats()
-                just_bound = True
-                log.info(f"bound first chat_id={chat_id}")
-            else:
-                await self.send(chat_id, "⛔ Доступ запрещён.")
-                log.warning(f"unauthorized chat_id={chat_id}")
-                return
+        # Public bot, license-gated: anyone may /start, but the owner menu (balances,
+        # status, PnL — this instance's real money) unlocks only after the chat enters
+        # a valid subscription license key (verified via the backend). `_has_access`
+        # is true for pre-authorized operator chats (env/legacy) and licensed chats.
+        is_owner = self._has_access(chat_id)
 
         parts = text.split()
         cmd = parts[0].split("@")[0].lower()
         arg = parts[1] if len(parts) > 1 else None
         rest = parts[1:]
 
+        # License entry: explicit /key, or — when we just asked for it — the next plain
+        # (non-command) message is taken as the key.
+        if cmd == "/key":
+            await self._cmd_key(chat_id, " ".join(rest))
+            return
+        if not is_owner and not cmd.startswith("/") and chat_id in self._awaiting_key:
+            await self._cmd_key(chat_id, text)
+            return
+
+        # Owner-only telemetry — exposes this instance's live real balances/PnL.
+        if cmd in ("/balances", "/balance", "/status", "/pnl") and not is_owner:
+            await self.send(chat_id, "🔒 Сначала введите ключ лицензии подписки: /key <ключ>")
+            self._awaiting_key.add(chat_id)
+            log.info(f"owner-only cmd {cmd} refused (locked) for chat_id={chat_id}")
+            return
+
         if cmd in ("/start",):
-            await self._cmd_start(chat_id, just_bound)
+            await self._cmd_start(chat_id, False, is_owner)
         elif cmd in ("/help",):
-            await self.send(chat_id, self._help_text(), self._main_keyboard())
+            await self.send(chat_id, self._help_text(is_owner), self._main_keyboard(is_owner))
         elif cmd == "/balances":
             await self._cmd_balances(chat_id)
         elif cmd == "/balance":
@@ -524,7 +658,12 @@ class TelegramBot:
         elif cmd == "/cancel":
             await self._cmd_cancel(chat_id)
         else:
-            await self.send(chat_id, "Неизвестная команда. /help")
+            if not is_owner:
+                self._awaiting_key.add(chat_id)
+                await self.send(chat_id, "🔒 Введите ключ лицензии подписки, чтобы продолжить:\n"
+                                         "<code>/key &lt;ваш-ключ&gt;</code>")
+            else:
+                await self.send(chat_id, "Неизвестная команда. /help")
 
     # ---------- mini app tunnel resolution ----------
     def _resolve_miniapp_url(self) -> str | None:
@@ -567,6 +706,7 @@ class TelegramBot:
         """Brand the bot: command menu, description, and the chat menu button.
         Idempotent — Telegram just overwrites on each start."""
         commands = [
+            {"command": "key", "description": "🔑 Ввести ключ лицензии"},
             {"command": "balances", "description": "👁 Балансы по биржам"},
             {"command": "status", "description": "Статус бота"},
             {"command": "pnl", "description": "PnL и винрейт"},

@@ -18,10 +18,14 @@ import sys
 from pathlib import Path
 
 from logsetup import get_logger
+from appdir import BASE_DIR
 
 log = get_logger("tunnel")
 
-ROOT = Path(__file__).parent
+# Folder of the .exe when frozen (not the _MEIPASS temp). cloudflared.exe, .env,
+# config and logs all live next to the exe — Path(__file__).parent would point
+# into the per-process temp dir in a PyInstaller build.
+ROOT = BASE_DIR
 DASHBOARD_PORT = 8765
 TUNNEL_LOG = ROOT / "dashboard_tunnel.log"
 # Named-tunnel config (your own domain). If this file exists, it takes priority

@@ -41,7 +41,10 @@ def init_logging(process_name: str, level: str = "INFO"):
         encoding="utf-8",
     )
     file_handler.setFormatter(fmt)
-    file_handler.setLevel(logging.DEBUG)
+    # File level configurable via LOG_FILE_LEVEL (default INFO). DEBUG floods the
+    # file with httpcore/httpx plumbing and rotates 10MB every few hours.
+    _file_level = os.getenv("LOG_FILE_LEVEL", "INFO")
+    file_handler.setLevel(getattr(logging, _file_level.upper(), logging.INFO))
     root.addHandler(file_handler)
 
     # Stderr: INFO+ (won't break rich.Live which uses stdout)
@@ -51,11 +54,15 @@ def init_logging(process_name: str, level: str = "INFO"):
     root.addHandler(stream_handler)
 
     # Tame noisy libraries
-    logging.getLogger("ccxt").setLevel(logging.WARNING)
-    logging.getLogger("ccxt.pro").setLevel(logging.WARNING)
-    logging.getLogger("aiohttp").setLevel(logging.WARNING)
-    logging.getLogger("urllib3").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    # NB: do NOT silence "telegram" — that is this app's OWN logger name
+    # (get_logger("telegram")), not a third-party lib. The bot talks to the
+    # Telegram API directly over httpx, so the real noise is httpcore/httpx.
+    for noisy in (
+        "ccxt", "ccxt.pro", "aiohttp", "urllib3", "uvicorn.access",
+        "httpcore", "httpx", "httpcore.http11", "httpcore.connection",
+        "hpack", "websockets", "asyncio",
+    ):
+        logging.getLogger(noisy).setLevel(logging.WARNING)
 
 
 def get_logger(name: str) -> logging.Logger:

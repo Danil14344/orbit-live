@@ -8,7 +8,13 @@ import sqlite3
 import time
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent / "orbit.db"
+from appdir import BASE_DIR
+
+# Must resolve against the stable app home (folder of the .exe when frozen), NOT
+# Path(__file__).parent — in a PyInstaller build that points into a per-process
+# _MEIPASS temp dir, so the scanner and the dashboard would each open a DIFFERENT
+# orbit.db (split-brain: dashboard shows no trades / bot "offline").
+DB_PATH = BASE_DIR / "orbit.db"
 
 
 def get_conn():

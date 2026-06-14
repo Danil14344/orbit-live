@@ -236,12 +236,13 @@ async def _reconcile_fill(ex, res, sym):
 
 
 async def _buy(ex, sym, usd, slip_cap_pct, dry):
+    """Returns (usd_spent, filled_qty, avg_price)."""
     ob = await asyncio.wait_for(ex.fetch_order_book(sym, limit=10), timeout=5.0)
     ask = ob["asks"][0][0]
     amount = float(ex.amount_to_precision(sym, usd / ask))
     if dry:
         log.info(f"[REBAL DRY] would BUY {amount} {sym}@{ex.id} ioc<= ask×(1+{slip_cap_pct}%) (~${usd:.2f})")
-        return amount * ask
+        return amount * ask, amount, ask
     # Some venues (bitget) reject limit-buy prices too far above market (price band,
     # err 41118). Retry with progressively tighter buffer so the seed still goes in.
     last = None
@@ -252,7 +253,7 @@ async def _buy(ex, sym, usd, slip_cap_pct, dry):
                                                        {"timeInForce": "IOC"}), timeout=15.0)
             f, avg = await _reconcile_fill(ex, o, sym)
             log.info(f"[REBAL] BUY {sym}@{ex.id} filled={f} avg={avg} (~${f * avg:.2f}) buf={buf}%")
-            return f * avg
+            return f * avg, f, avg
         except Exception as e:
             last = e
             if "41118" in str(e) or "price" in str(e).lower():
@@ -262,23 +263,24 @@ async def _buy(ex, sym, usd, slip_cap_pct, dry):
 
 
 async def _sell_all(ex, base, slip_cap_pct, balance_cache, dry):
+    """Returns (usd_recovered, filled_qty, avg_price)."""
     sym = f"{base}/USDT"
     qty = balance_cache.available(ex.id, base) if balance_cache else 0
     if qty <= 0:
-        return 0.0
+        return 0.0, 0.0, 0.0
     try:
         amount = float(ex.amount_to_precision(sym, qty))
     except Exception:
         amount = qty
     if amount <= 0:
-        return 0.0
+        return 0.0, 0.0, 0.0
     if dry:
         log.info(f"[REBAL DRY] would SELL {amount} {sym}@{ex.id} (liquidate)")
-        return 0.0
+        return 0.0, 0.0, 0.0
     o = await asyncio.wait_for(ex.create_market_sell_order(sym, amount), timeout=15.0)
     f, avg = await _reconcile_fill(ex, o, sym)
     log.info(f"[REBAL] SELL {sym}@{ex.id} filled={f} avg={avg} (~${f * avg:.2f})")
-    return f * avg
+    return f * avg, f, avg
 
 
 def _mark(hub, base):
@@ -443,7 +445,12 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
             ex = ex_by_id.get(exid)
             if ex is not None:
                 try:
-                    await _sell_all(ex, tok, slip_cap, bc, dry)
+                    _u, q, p = await _sell_all(ex, tok, slip_cap, bc, dry)
+                    if not dry and q > 0 and getattr(executor, "guard", None) is not None:
+                        try:
+                            executor.guard.on_fill(exid, tok, "sell", q, p or _mark(hub, tok))
+                        except Exception as e:
+                            log.debug(f"[REBAL] guard.on_fill(sell) failed: {str(e)[:60]}")
                 except Exception as e:
                     log.error(f"[REBAL] sell {tok}@{exid} failed: {str(e)[:80]}")
         off_target_streak.pop(tok, None)
@@ -463,8 +470,24 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
     # can't sell — executor would just reject it for missing inventory).
     funded = {t for t in target_set if t not in to_add}
     spent = 0.0
+    # Hedge-margin cap: never seed more HEDGEABLE spot than the futures wallet can
+    # short at the configured leverage. Seeding beyond this is exactly what created
+    # the naked COAI/JCT positions — the reconcile loop tries to hedge it, margin
+    # caps the short, and the excess sits delta-exposed with no stop. Cap at source.
+    hedge_cap_usd = float("inf")
+    hedgeable_spent = 0.0
+    if hedge is not None and getattr(hedge, "futures", None) is not None and not dry:
+        try:
+            fb = await hedge.futures.fetch_balance()
+            free_fut = float((fb.get("USDT") or {}).get("free") or 0)
+            lev = float(getattr(hedge.cfg, "leverage", 1) or 1)
+            hedge_cap_usd = max(0.0, free_fut * lev * 0.9)
+            log.info(f"[REBAL] hedge-margin seed cap: free_fut=${free_fut:.0f} x{lev:.0f} -> ${hedge_cap_usd:.0f}")
+        except Exception as e:
+            log.debug(f"[REBAL] hedge margin probe failed: {str(e)[:60]}")
     for tok in to_add:
         sym = f"{tok}/USDT"
+        hedgeable = hedge is not None and hedge.can_hedge(tok)
         for exid in LIVE_ROUTE:
             ex = ex_by_id.get(exid)
             if ex is None or sym not in (ex.markets or {}):
@@ -476,6 +499,16 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
             if (total_usdt - spent - need) < reserve_floor:
                 log.info(f"[REBAL] skip buy {tok}@{exid}: would breach USDT reserve")
                 continue
+            # Cap hedgeable seeds to remaining hedge capacity.
+            if hedgeable:
+                remaining_hedge = hedge_cap_usd - hedgeable_spent
+                if remaining_hedge < 1:
+                    log.warning(f"[REBAL] skip seed {tok}@{exid}: hedge margin exhausted "
+                                f"(cap ${hedge_cap_usd:.0f}) — would create naked spot")
+                    continue
+                if need > remaining_hedge:
+                    log.info(f"[REBAL] cap seed {tok}@{exid}: ${need:.0f} -> ${remaining_hedge:.0f} (hedge margin)")
+                    need = remaining_hedge
             # Seed with what's actually here instead of all-or-nothing: a $1 USDT
             # shortfall on bitget left XPL unseeded on its SELL venue and cost 76
             # above-threshold windows (2026-06-12). Partial inventory still trades —
@@ -488,10 +521,20 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
                 log.info(f"[REBAL] partial seed {tok}@{exid}: ${affordable:.0f} of ${need:.0f} (all USDT here)")
                 need = affordable
             try:
-                got = await _buy(ex, sym, need, slip_cap, dry)
+                got, qty, price = await _buy(ex, sym, need, slip_cap, dry)
                 spent += got
+                if hedgeable:
+                    hedgeable_spent += got
                 if got > 0:
                     funded.add(tok)
+                    # Record the seed into the inventory guard so it counts toward the
+                    # per-token cap and (for any naked remainder) the stop-loss — seeded
+                    # inventory used to be invisible to risk management entirely.
+                    if not dry and qty > 0 and getattr(executor, "guard", None) is not None:
+                        try:
+                            executor.guard.on_fill(exid, tok, "buy", qty, price or _mark(hub, tok))
+                        except Exception as e:
+                            log.debug(f"[REBAL] guard.on_fill failed: {str(e)[:60]}")
             except Exception as e:
                 log.error(f"[REBAL] buy {tok}@{exid} failed: {str(e)[:80]}")
 

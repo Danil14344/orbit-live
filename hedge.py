@@ -120,6 +120,44 @@ class HedgeManager:
     def can_hedge(self, token: str) -> bool:
         return token in self.perp_symbol
 
+    async def sync_shorts_to_real(self):
+        """Re-sync tracked short qty/entry to the ACTUAL open futures positions.
+        Self-heals any drift between book and exchange (e.g. a margin-capped order
+        that under-filled, or a manual close) so the reconcile loop never trusts a
+        phantom short. Called periodically. Live only."""
+        if not self.live or self.cfg.dry_run or self.futures is None:
+            return
+        try:
+            positions = await self.futures.fetch_positions()
+        except Exception as e:
+            log.debug(f"[HEDGE] sync_shorts_to_real fetch failed: {str(e)[:90]}")
+            return
+        real = {}
+        for p in positions:
+            c = float(p.get("contracts") or 0)
+            if c > 0 and p.get("side") == "short":
+                base = (p.get("symbol") or "").split("/")[0]
+                real[base] = (c, float(p.get("entryPrice") or 0))
+        changed = False
+        for token in list(self.shorts.keys()):
+            if token not in real and self.shorts[token]["qty"] > 0:
+                log.warning(f"[HEDGE sync] {token}: tracked short {self.shorts[token]['qty']:.4f} "
+                            f"but exchange has none — correcting to 0 (was phantom)")
+                self.shorts[token] = {"qty": 0.0, "entry_avg": 0.0, "opened_ts": 0.0, "last_funding_ts": 0.0}
+                changed = True
+        for base, (qty, entry) in real.items():
+            s = self.shorts[base]
+            if abs(s["qty"] - qty) > max(1e-9, qty * 0.001):
+                log.warning(f"[HEDGE sync] {base}: tracked short {s['qty']:.4f} -> real {qty:.4f} (corrected)")
+                changed = True
+            s["qty"] = qty
+            if entry > 0:
+                s["entry_avg"] = entry
+            if s["opened_ts"] == 0:
+                s["opened_ts"] = time.time(); s["last_funding_ts"] = time.time()
+        if changed:
+            self._save_state()
+
     async def _place(self, side: str, token: str, qty: float, reduce_only: bool) -> float:
         """Send (or in dry_run, log) a futures market order. side='sell' opens/grows
         the short; side='buy' (reduceOnly) closes it. One-way mode.
@@ -188,6 +226,15 @@ class HedgeManager:
             self._lev_set.add(sym)
         order = await self.futures.create_order(sym, "market", side, amt, None, params)
         log.info(f"[HEDGE LIVE] {side} {amt} {sym} reduceOnly={reduce_only} -> id={order.get('id')}")
+        # Return the qty ACTUALLY placed so the caller tracks reality, not intent.
+        # Prefer the venue-reported filled amount; fall back to the (margin-capped)
+        # requested amt. Without this, a margin-capped short was recorded at full
+        # size → "phantom hedge": book says hedged, exchange is naked.
+        try:
+            filled = float(order.get("filled") or 0)
+        except (TypeError, ValueError):
+            filled = 0.0
+        return filled if filled > 0 else amt
 
     def _load_state(self):
         if not os.path.exists(self.cfg.state_path):
@@ -230,33 +277,46 @@ class HedgeManager:
             return
         now = time.time()
         if delta > 0:
-            # Grow short — place the futures order FIRST; only update tracked state on success
+            # Grow short — place the futures order FIRST; record only what ACTUALLY
+            # filled (margin cap may shrink it). Recording the requested delta here is
+            # exactly what created the phantom hedge: tracked short > real short.
+            placed = delta
             if self.live:
                 try:
-                    await self._place("sell", token, delta, reduce_only=False)
+                    placed = await self._place("sell", token, delta, reduce_only=False)
                 except Exception as e:
                     log.error(f"[HEDGE LIVE] open short {token} +{delta:.4f} FAILED: {e} — position UNDER-HEDGED")
                     return
-            new_qty = s["qty"] + delta
-            s["entry_avg"] = (s["qty"] * s["entry_avg"] + delta * mark_price) / new_qty
+                placed = float(placed or 0)
+                if placed <= 0:
+                    log.warning(f"[HEDGE LIVE] short {token} +{delta:.4f} placed 0 (margin-capped) "
+                                f"— tracked short unchanged, position UNDER-HEDGED by ~${delta * mark_price:.0f}")
+                    return
+            new_qty = s["qty"] + placed
+            s["entry_avg"] = (s["qty"] * s["entry_avg"] + placed * mark_price) / new_qty
             s["qty"] = new_qty
             if s["opened_ts"] == 0:
                 s["opened_ts"] = now
                 s["last_funding_ts"] = now
             mode = "LIVE" if self.live else "PAPER"
-            log.info(f"[HEDGE {mode}] short {token} +{delta:.4f} @ {mark_price:.6g} | total_short={s['qty']:.4f} entry_avg={s['entry_avg']:.6g}")
+            short_fall = max(0.0, delta - placed)
+            tail = f" | UNDER-HEDGED short_fall={short_fall:.4f} (~${short_fall * mark_price:.0f})" if short_fall * mark_price >= 1 else ""
+            log.info(f"[HEDGE {mode}] short {token} +{placed:.4f} @ {mark_price:.6g} | total_short={s['qty']:.4f} entry_avg={s['entry_avg']:.6g}{tail}")
         else:
             # Reduce short — close on the futures side first, then realize PnL in state
             closed_qty = -delta
             if self.live:
                 try:
-                    await self._place("buy", token, closed_qty, reduce_only=True)
+                    placed = await self._place("buy", token, closed_qty, reduce_only=True)
                 except Exception as e:
                     log.error(f"[HEDGE LIVE] close short {token} -{closed_qty:.4f} FAILED: {e} — short still OPEN")
                     return
+                placed = float(placed or 0)
+                if placed > 0:
+                    closed_qty = min(closed_qty, placed)
             pnl = (s["entry_avg"] - mark_price) * closed_qty
             self.realized_pnl_usd += pnl
-            s["qty"] += delta
+            s["qty"] -= closed_qty
             mode = "LIVE" if self.live else "PAPER"
             log.info(f"[HEDGE {mode}] close short {token} -{closed_qty:.4f} @ {mark_price:.6g} | pnl=${pnl:+.4f} | remaining={s['qty']:.4f}")
             if s["qty"] <= 1e-9:
@@ -346,9 +406,13 @@ class HedgeManager:
             free = float((bal.get("USDT") or {}).get("free") or 0)
         except Exception:
             return
-        keep = float(os.getenv("HEDGE_SWAP_USDT_BUFFER", "15"))
+        # Keep enough idle futures margin to hedge ~2 new positions. Sweeping down to
+        # $15 starved the hedge so every new short got margin-capped — the chronic
+        # PARTIAL-hedge / naked-inventory cause. Tunable via HEDGE_SWAP_USDT_BUFFER.
+        _pos = float(os.getenv("POSITION_USD", "25"))
+        keep = float(os.getenv("HEDGE_SWAP_USDT_BUFFER", str(max(40.0, 2 * _pos))))
         excess = free - keep
-        if excess < 5.0:
+        if excess < 10.0:
             return
         spot = self.ex_by_id.get(self.cfg.futures_exchange)
         if spot is None:

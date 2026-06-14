@@ -170,6 +170,16 @@ class InventoryGuard:
                 continue
             if token in STABLES:
                 continue
+            # Hedge-aware: a token covered by a perp short is protected by the hedge,
+            # not by a spot stop-loss — selling its spot leg would flip it net-short.
+            # Only the NAKED portion needs a stop; if it's substantially hedged, the
+            # hedge owns the downside, so skip. (Seeding is margin-capped so a token
+            # meant to be hedged shouldn't sit mostly naked here.)
+            if self.hedge is not None:
+                _s = self.hedge.shorts.get(token)
+                _short = float(_s.get("qty", 0)) if _s else 0.0
+                if _short >= pos["qty"] * 0.5:
+                    continue
             # Find best (highest) bid across all exchanges for liquidation reference
             best_bid = 0.0
             best_ex = None
