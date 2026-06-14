@@ -343,6 +343,16 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
         if tok in MAJOR_TOKENS:
             log.info(f"[REBAL] skip {tok}: major (phantom spread, not real arb)")
             continue
+        # Executability gate: the shadow ranking measures the FEED edge, not whether
+        # the bot can actually catch both legs. Skip tokens that one-leg too often live
+        # (fast microcaps whose spread evaporates in the order-flight window, e.g. XPL).
+        ol_rate, ol_n = executor.token_one_legged_rate(tok)
+        ol_min_n = _i("REBALANCE_EXEC_MIN_ATTEMPTS", "5")
+        ol_max_rate = _f("REBALANCE_MAX_ONE_LEGGED_PCT", "60") / 100
+        if ol_rate is not None and ol_n >= ol_min_n and ol_rate >= ol_max_rate:
+            log.info(f"[REBAL] skip {tok}: one-legged {ol_rate*100:.0f}% over {ol_n} live "
+                     f"attempts (>= {ol_max_rate*100:.0f}%) — shadow edge not catchable live")
+            continue
         if time.time() < PHANTOM_BANNED_UNTIL.get(tok, 0):
             log.info(f"[REBAL] skip {tok}: phantom soft-ban (stale-feed strikes)")
             continue

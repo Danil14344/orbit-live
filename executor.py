@@ -230,6 +230,11 @@ class Executor:
         # ---- leg-risk telemetry ----
         self.outcomes: dict[str, int] = defaultdict(int)   # rec.status -> count
         self.leg_miss: dict[str, int] = defaultdict(int)   # leg-miss verdict -> count
+        # Per-token live executability: how often a token actually completes both legs
+        # vs one-legs / imbalances. Feeds the rebalancer so it stops re-seeding tokens
+        # whose shadow edge can't be caught live (e.g. fast microcaps like XPL).
+        self.token_attempts: dict[str, int] = defaultdict(int)     # token -> executions recorded
+        self.token_one_legged: dict[str, int] = defaultdict(int)   # token -> one-legged/imbalance outcomes
         self.slip_sum: float = 0.0    # sum(expected_net_pct - actual_net_pct) over filled trades
         self.slip_n: int = 0          # count of filled trades measured
         self.preexec_ws_hits: int = 0   # pre-exec legs served from a fresh ws quote
@@ -260,6 +265,8 @@ class Executor:
             self.total_trades = s.get("total_trades", 0)
             self.total_wins = s.get("total_wins", 0)
             self.outcomes = defaultdict(int, s.get("outcomes", {}))
+            self.token_attempts = defaultdict(int, s.get("token_attempts", {}))
+            self.token_one_legged = defaultdict(int, s.get("token_one_legged", {}))
             self.slip_sum = s.get("slip_sum", 0.0)
             self.slip_n = s.get("slip_n", 0)
             self.preexec_ws_hits = s.get("preexec_ws_hits", 0)
@@ -275,6 +282,8 @@ class Executor:
             "total_trades": self.total_trades,
             "total_wins": self.total_wins,
             "outcomes": dict(self.outcomes),
+            "token_attempts": dict(self.token_attempts),
+            "token_one_legged": dict(self.token_one_legged),
             "slip_sum": self.slip_sum,
             "slip_n": self.slip_n,
             "preexec_ws_hits": self.preexec_ws_hits,
@@ -617,6 +626,14 @@ class Executor:
         self.total_trades += 1
         # ---- leg-risk telemetry ----
         self.outcomes[rec.status] += 1
+        # ---- per-token executability ----
+        _tok = (rec.symbol or "").split("/")[0]
+        if _tok:
+            self.token_attempts[_tok] += 1
+            if rec.status in ("kept_buy_excess", "rebalanced_sell_excess",
+                              "sell_only_unfilled", "hedged_sell_failed",
+                              "hedged_buy_failed", "both_failed"):
+                self.token_one_legged[_tok] += 1
         if rec.status == "ok":
             self.last_fill_ts = time.time()
             if rec.actual_net_pct is not None and rec.expected_net_pct is not None:
@@ -643,6 +660,16 @@ class Executor:
                 asyncio.create_task(self.notifier.notify_close(rec))
             except Exception:
                 pass
+
+    def token_one_legged_rate(self, token: str):
+        """(rate, attempts) of one-legged/imbalance outcomes for a token over its
+        recorded live executions. Used by the rebalancer to avoid re-seeding tokens
+        whose shadow edge can't be caught live. Returns (None, attempts) below the
+        sample floor (not enough data to judge)."""
+        a = self.token_attempts.get(token, 0)
+        if a <= 0:
+            return None, 0
+        return self.token_one_legged.get(token, 0) / a, a
 
     # ---------- PAPER execution ----------
     async def _execute_paper(self, opp) -> TradeRecord:
