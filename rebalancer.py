@@ -551,6 +551,13 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
                 hedge.exclude.discard(t)
             else:
                 hedge.exclude.add(t)
+        # Persist so the choice survives a restart (otherwise startup reverts to the
+        # stale .env WHITELIST seed until the next pass — up to 30min of mis-trading).
+        try:
+            from executor import save_persisted_whitelist
+            save_persisted_whitelist()
+        except Exception as e:
+            log.debug(f"[REBAL] whitelist persist failed: {str(e)[:60]}")
         log.info(f"[REBAL] whitelist updated in-process -> {sorted(WHITELIST_TOKENS)}; "
                  f"hedge.exclude={sorted(hedge.exclude)} (hedgeable seeded tokens will be shorted)")
     else:

@@ -56,10 +56,43 @@ PHANTOM_BANNED_UNTIL: dict[str, float] = {}
 
 # Whitelist mode — if non-empty, ONLY these tokens are traded. Others are logged
 # to shadow_opps.jsonl as "would have traded" for later analysis (swap candidates).
-# Loaded from WHITELIST env var (comma-separated bases, e.g. "OPG,ULTIMA,BSB").
+# Seeded from WHITELIST env var (comma-separated bases, e.g. "OPG,ULTIMA,BSB").
+# The rebalancer mutates this set at runtime and PERSISTS its choice to
+# WHITELIST_STATE_PATH; on startup we restore that choice so a restart doesn't
+# revert to a stale .env seed and trade the wrong (or no) tokens for ~30min until
+# the next rebalancer pass.
+WHITELIST_STATE_PATH = str(BASE_DIR / "whitelist_state.json")
 WHITELIST_TOKENS: set[str] = {
     t.strip().upper() for t in os.getenv("WHITELIST", "").split(",") if t.strip()
 }
+
+
+def load_persisted_whitelist() -> bool:
+    """Restore the rebalancer's last persisted whitelist over the .env seed.
+    Returns True if a non-empty persisted set was applied. Call once at startup."""
+    try:
+        with open(WHITELIST_STATE_PATH) as f:
+            saved = {t.strip().upper() for t in (json.load(f).get("whitelist") or []) if t.strip()}
+    except Exception:
+        return False
+    if saved:
+        WHITELIST_TOKENS.clear()
+        WHITELIST_TOKENS.update(saved)
+        log.info(f"[WHITELIST] restored persisted set -> {sorted(WHITELIST_TOKENS)}")
+        return True
+    return False
+
+
+def save_persisted_whitelist():
+    """Persist the current whitelist so it survives a restart. Called by the
+    rebalancer whenever it changes the set."""
+    try:
+        with open(WHITELIST_STATE_PATH, "w") as f:
+            json.dump({"whitelist": sorted(WHITELIST_TOKENS), "ts": time.time()}, f)
+    except Exception as e:
+        log.debug(f"[WHITELIST] persist failed: {e}")
+
+
 SHADOW_LOG_PATH = "shadow_opps.jsonl"
 
 # ====== SUBSCRIPTION TIER MOCK ======

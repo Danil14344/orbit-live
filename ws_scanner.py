@@ -877,6 +877,11 @@ async def main():
         journal_path="trades.jsonl",
         state_path="executor_state.json",
     ))
+    # Restore the rebalancer's last persisted whitelist over the stale .env seed so a
+    # restart keeps trading the bot's own chosen tokens instead of reverting for ~30min.
+    if EXEC_MODE == Mode.LIVE:
+        from executor import load_persisted_whitelist
+        load_persisted_whitelist()
     # Futures client for the delta-neutral hedge (live only). 1x leverage, dry-run by
     # default — set HEDGE_DRY_RUN=0 in .env to actually place orders after a smoke test.
     hedge_dry_run = os.getenv("HEDGE_DRY_RUN", "1").lower() not in ("0", "false", "no")
