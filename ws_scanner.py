@@ -664,43 +664,65 @@ async def live_drawdown_monitor(executor, hedge, hub, interval_sec=60):
                                str(getattr(executor.cfg, "daily_drawdown_pct_stop", 10.0))))
     start_equity = None
     day_anchor = time.time()
+    # Debounce: a single low reading must NOT trip the 6h kill-switch. Equity is fragile
+    # for hedged inventory — if a held token's spot mark momentarily drops out of the hub,
+    # we'd book the short's uPnL loss without the offsetting spot gain (delta-neutral
+    # cancellation breaks) and falsely show a ~$25 "drawdown". Require N consecutive
+    # breaches (marks refresh within a minute, so a real drawdown persists; an artifact
+    # does not). Same guard if the futures balance fetch fails (don't treat $0 as real).
+    consec_needed = int(float(os.getenv("DRAWDOWN_BREACH_CONSEC", "3")))
+    breach_streak = 0
     await asyncio.sleep(90)   # warm up balances/marks
-    dl.info(f"live drawdown monitor started (stop={stop_pct:.0f}%, interval={interval_sec}s)")
+    dl.info(f"live drawdown monitor started (stop={stop_pct:.0f}%, interval={interval_sec}s, "
+            f"breach_consec={consec_needed})")
     while True:
         try:
-            # futures wallet USDT (margin not counted in spot)
+            # futures wallet USDT (margin not counted in spot). On fetch failure, SKIP
+            # this tick entirely — a transient $0 would look like a ~$50 phantom loss.
             fut = 0.0
+            fut_ok = True
             if hedge is not None and getattr(hedge, "futures", None) is not None and not hedge.cfg.dry_run:
                 try:
                     fb = await hedge.futures.fetch_balance()
                     fut = float((fb.get("total") or {}).get("USDT") or 0)
                 except Exception:
-                    fut = 0.0
+                    fut_ok = False
             spot = bc.total_usdt_value(hub) if hub is not None else 0.0
             upnl = hedge.unrealized_pnl_usd() if hedge is not None else 0.0
             equity = spot + fut + upnl
             now = time.time()
+            if not fut_ok:
+                await asyncio.sleep(interval_sec)
+                continue
             # daily reset
             if now - day_anchor >= 86400:
                 start_equity = equity
                 day_anchor = now
+                breach_streak = 0
             if start_equity is None or start_equity <= 0:
                 if equity > 0:
                     start_equity = equity
                     dl.info(f"drawdown baseline set: equity=${equity:.2f}")
             elif equity > 0:
                 dd = (1 - equity / start_equity) * 100
-                if dd >= stop_pct and now >= executor.paused_until:
-                    executor.paused_until = now + 6 * 3600
-                    msg = (f"LIVE DRAWDOWN STOP: equity ${equity:.2f} vs start ${start_equity:.2f} "
-                           f"(-{dd:.1f}% >= {stop_pct:.0f}%) — trading PAUSED 6h")
-                    dl.error(msg)
-                    notifier = getattr(executor, "notifier", None)
-                    if notifier is not None:
-                        try:
-                            await notifier.broadcast(f"🛑 {msg}")
-                        except Exception:
-                            pass
+                if dd >= stop_pct:
+                    breach_streak += 1
+                    dl.warning(f"drawdown breach {breach_streak}/{consec_needed}: equity ${equity:.2f} "
+                               f"vs start ${start_equity:.2f} (-{dd:.1f}%) "
+                               f"[spot=${spot:.0f} fut=${fut:.0f} upnl=${upnl:+.1f}]")
+                    if breach_streak >= consec_needed and now >= executor.paused_until:
+                        executor.paused_until = now + 6 * 3600
+                        msg = (f"LIVE DRAWDOWN STOP: equity ${equity:.2f} vs start ${start_equity:.2f} "
+                               f"(-{dd:.1f}% >= {stop_pct:.0f}%, {consec_needed}x) — trading PAUSED 6h")
+                        dl.error(msg)
+                        notifier = getattr(executor, "notifier", None)
+                        if notifier is not None:
+                            try:
+                                await notifier.broadcast(f"🛑 {msg}")
+                            except Exception:
+                                pass
+                else:
+                    breach_streak = 0
         except Exception as e:
             dl.warning(f"drawdown monitor error: {str(e)[:90]}")
         await asyncio.sleep(interval_sec)
