@@ -18,7 +18,8 @@ log = get_logger("balances")
 class RealBalanceCache:
     """Live mode: cache of real exchange balances, refreshed every N sec."""
 
-    def __init__(self, ex_by_id, refresh_sec=30, snapshot_path=str(BASE_DIR / "balances_snapshot.json"), hub=None):
+    def __init__(self, ex_by_id, refresh_sec=30, snapshot_path=str(BASE_DIR / "balances_snapshot.json"),
+                 hub=None, futures_client=None, futures_ex_id=None):
         self.ex_by_id = ex_by_id
         self.refresh_sec = refresh_sec
         self.balances: dict[str, dict[str, float]] = defaultdict(dict)
@@ -26,6 +27,12 @@ class RealBalanceCache:
         self.errors: dict[str, str] = {}
         self.snapshot_path = snapshot_path
         self.hub = hub                       # for USD valuation (dust filter)
+        # Optional futures/swap wallet (e.g. bingx hedge margin) so the snapshot total
+        # isn't undercounted by the USDT locked as hedge margin + free swap USDT.
+        self.futures_client = futures_client
+        self.futures_ex_id = futures_ex_id
+        self.futures_usdt: float = 0.0       # free+used USDT on the swap wallet
+        self.futures_update: float = 0.0
 
     DUST_USD = 1.0                            # hide balances worth less than this
 
@@ -69,11 +76,24 @@ class RealBalanceCache:
                     "updated_at": self.last_update.get(ex_id, 0),
                     "error": self.errors.get(ex_id),
                 }
+            # Futures/swap wallet (hedge margin) as its own card so the grand total
+            # reflects USDT locked as hedge margin, not just spot. value == USDT here.
+            futures_usdt = 0.0
+            if self.futures_client is not None and self.futures_ex_id:
+                futures_usdt = round(self.futures_usdt, 2)
+                exchanges[f"{self.futures_ex_id}_futures"] = {
+                    "balances": {"USDT": futures_usdt} if futures_usdt >= self.DUST_USD else {},
+                    "usdt": futures_usdt,
+                    "value_usd": futures_usdt,
+                    "updated_at": self.futures_update,
+                    "error": None,
+                }
+            usdt_total = sum(b.get("USDT", 0) for b in self.balances.values()) + futures_usdt
             data = {
                 "ts": time.time(),
                 "exchanges": exchanges,
-                "usdt_total": sum(b.get("USDT", 0) for b in self.balances.values()),
-                "spot_value_total": round(spot_value_total, 2),
+                "usdt_total": usdt_total,
+                "spot_value_total": round(spot_value_total + futures_usdt, 2),
             }
             with open(self.snapshot_path, "w") as f:
                 json.dump(data, f)
@@ -94,8 +114,25 @@ class RealBalanceCache:
             self.errors[ex_id] = str(e)[:80]
             log.warning(f"fetch_balance({ex_id}) failed: {type(e).__name__}: {str(e)[:200]}")
 
+    async def refresh_futures(self):
+        """Fetch the swap-wallet USDT (free+used) on the hedge venue so the snapshot
+        total includes hedge margin. Read-only. No-op without a futures client."""
+        if self.futures_client is None:
+            return
+        try:
+            bal = await self.futures_client.fetch_balance()
+            u = bal.get("USDT") or {}
+            self.futures_usdt = float(u.get("total") or
+                                      (float(u.get("free") or 0) + float(u.get("used") or 0)))
+            self.futures_update = time.time()
+        except Exception as e:
+            log.warning(f"fetch_balance(futures {self.futures_ex_id}) failed: {str(e)[:120]}")
+
     async def refresh_all(self):
-        await asyncio.gather(*(self.refresh_one(ex_id) for ex_id in self.ex_by_id))
+        await asyncio.gather(
+            *(self.refresh_one(ex_id) for ex_id in self.ex_by_id),
+            self.refresh_futures(),
+        )
         self.write_snapshot()
 
     async def watch(self):

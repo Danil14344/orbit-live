@@ -919,7 +919,10 @@ async def main():
             feeders.append(asyncio.create_task(paper_bal_cache.watch()))
             console.print(f"[cyan]Balance snapshot (read-only): {list(authed.keys())} every 60s[/cyan]")
     else:
-        executor.balance_cache = RealBalanceCache(ex_by_id, refresh_sec=30, hub=hub)
+        executor.balance_cache = RealBalanceCache(
+            ex_by_id, refresh_sec=30, hub=hub,
+            futures_client=futures_client, futures_ex_id=hedge_cfg.futures_exchange,
+        )
         feeders.append(asyncio.create_task(executor.balance_cache.watch()))
         console.print(f"[cyan]RealBalanceCache: refresh every 30s[/cyan]")
         # Auto-rebalancer: keeps live positioned in the tokens producing windows on the
