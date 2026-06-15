@@ -423,6 +423,44 @@ class HedgeManager:
         except Exception as e:
             log.warning(f"[HEDGE] margin sweep transfer failed: {str(e)[:120]}")
 
+    async def ensure_free_margin(self, target_usd: float) -> float:
+        """Proactively move idle spot USDT -> futures on the hedge venue so the
+        rebalancer can SEED (and we can hedge) up to target_usd of new inventory.
+        Without this the rebalancer caps seeds to whatever happens to be free in the
+        futures wallet — which after a sweep is ~$0 — so idle spot USDT deadlocks: it
+        can't seed because there's no margin, and margin only tops up lazily on a hedge
+        order that the cap already blocked. Keeps HEDGE_SPOT_USDT_RESERVE on spot.
+        Returns the resulting free futures USDT. Live only."""
+        if not self.live or self.cfg.dry_run or self.futures is None:
+            return 0.0
+        try:
+            fb = await self.futures.fetch_balance()
+            free = float((fb.get("USDT") or {}).get("free") or 0)
+        except Exception:
+            return 0.0
+        if free >= target_usd or target_usd <= 0:
+            return free
+        spot = self.ex_by_id.get(self.cfg.futures_exchange)
+        if spot is None:
+            return free
+        try:
+            sbal = await spot.fetch_balance()
+            sfree = float((sbal.get("USDT") or {}).get("free") or 0)
+        except Exception:
+            return free
+        reserve = float(os.getenv("HEDGE_SPOT_USDT_RESERVE", "25"))
+        amt = min(target_usd - free, max(0.0, sfree - reserve))
+        if amt < 1.0:
+            return free
+        try:
+            await spot.transfer("USDT", round(amt, 2), "spot", "swap")
+            log.info(f"[HEDGE] proactive margin top-up: ${amt:.2f} spot->swap on "
+                     f"{self.cfg.futures_exchange} (target=${target_usd:.0f}, free was ${free:.0f})")
+            return free + amt
+        except Exception as e:
+            log.warning(f"[HEDGE] proactive top-up failed: {str(e)[:100]}")
+            return free
+
     # ---------- Mark-to-market PnL of all open shorts ----------
     def unrealized_pnl_usd(self) -> float:
         total = 0.0

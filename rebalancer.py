@@ -488,11 +488,20 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
     hedgeable_spent = 0.0
     if hedge is not None and getattr(hedge, "futures", None) is not None and not dry:
         try:
-            fb = await hedge.futures.fetch_balance()
-            free_fut = float((fb.get("USDT") or {}).get("free") or 0)
             lev = float(getattr(hedge.cfg, "leverage", 1) or 1)
+            # Proactively pull idle spot USDT into futures margin to cover the hedgeable
+            # seeds we're about to place. Otherwise free_fut after a sweep is ~$0 and the
+            # whole pass seeds nothing while spot USDT sits idle — the no-trades deadlock.
+            hedgeable_add = [t for t in to_add if hedge.can_hedge(t)]
+            want_margin = (len(hedgeable_add) * per_token_usd * len(LIVE_ROUTE) / max(lev, 1)) if hedgeable_add else 0.0
+            if want_margin > 0:
+                free_fut = await hedge.ensure_free_margin(want_margin)
+            else:
+                fb = await hedge.futures.fetch_balance()
+                free_fut = float((fb.get("USDT") or {}).get("free") or 0)
             hedge_cap_usd = max(0.0, free_fut * lev * 0.9)
-            log.info(f"[REBAL] hedge-margin seed cap: free_fut=${free_fut:.0f} x{lev:.0f} -> ${hedge_cap_usd:.0f}")
+            log.info(f"[REBAL] hedge-margin seed cap: free_fut=${free_fut:.0f} x{lev:.0f} -> ${hedge_cap_usd:.0f}"
+                     + (f" (topped up for ${want_margin:.0f})" if want_margin > 0 else ""))
         except Exception as e:
             log.debug(f"[REBAL] hedge margin probe failed: {str(e)[:60]}")
     for tok in to_add:
