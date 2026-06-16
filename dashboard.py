@@ -27,7 +27,7 @@ except Exception:
 
 from appdir import BASE_DIR
 ROOT = BASE_DIR
-VERSION = "1.0.5"   # bumped on each release; auto-update compares this
+VERSION = "1.0.7"   # bumped on each release; auto-update compares this
 DEFAULT_BACKEND = "https://api.eyecryptbot.com"
 
 app = FastAPI()
@@ -922,7 +922,7 @@ td.tag { color: var(--text-dim); font-family: 'JetBrains Mono'; font-size: 11px;
     </div>
     <div style="display:flex; gap:8px;">
       <button class="btn-sec btn btn-sm" onclick="dismissUpdate()" data-i18n="later">Later</button>
-      <button class="btn btn-sm" onclick="doUpdate()" data-i18n="updateNow">Update now</button>
+      <button id="update-btn" class="btn btn-sm" onclick="doUpdate()" data-i18n="updateNow">Update now</button>
     </div>
   </div>
 
@@ -1078,6 +1078,7 @@ const I18N = {
     toastNoUrl:"No download URL", toastUpdateFail:"Update failed",
     confirmRestart:"Restart bot? Takes ~60 seconds.",
     confirmUpdate:"Update to v{v}?\n\nThe app will close and restart.",
+    confirmUpdateBtn:"Click again to confirm",
     tabCabinet:"Cabinet", secConnection:"Connection",
     cabSubscription:"Subscription", cabLoading:"Loading…", cabUpgrade:"Upgrade / Renew",
     cabLicense:"License", cabSaveLicense:"Save license", cabLanguage:"Language",
@@ -1121,6 +1122,7 @@ const I18N = {
     toastNoUrl:"Нет URL загрузки", toastUpdateFail:"Ошибка обновления",
     confirmRestart:"Перезапустить бота? Займёт ~60 секунд.",
     confirmUpdate:"Обновить до v{v}?\n\nПриложение закроется и перезапустится.",
+    confirmUpdateBtn:"Нажмите ещё раз",
     tabCabinet:"Кабинет", secConnection:"Подключение",
     cabSubscription:"Подписка", cabLoading:"Загрузка…", cabUpgrade:"Продлить / Улучшить",
     cabLicense:"Лицензия", cabSaveLicense:"Сохранить лицензию", cabLanguage:"Язык",
@@ -1164,6 +1166,7 @@ const I18N = {
     toastNoUrl:"Sin URL de descarga", toastUpdateFail:"Error de actualización",
     confirmRestart:"¿Reiniciar el bot? Tarda ~60 segundos.",
     confirmUpdate:"¿Actualizar a v{v}?\n\nLa app se cerrará y reiniciará.",
+    confirmUpdateBtn:"Pulse de nuevo para confirmar",
     tabCabinet:"Panel", secConnection:"Conexión",
     cabSubscription:"Suscripción", cabLoading:"Cargando…", cabUpgrade:"Mejorar / Renovar",
     cabLicense:"Licencia", cabSaveLicense:"Guardar licencia", cabLanguage:"Idioma",
@@ -1207,6 +1210,7 @@ const I18N = {
     toastNoUrl:"无下载 URL", toastUpdateFail:"更新失败",
     confirmRestart:"重启机器人？需要约 60 秒。",
     confirmUpdate:"更新到 v{v}？\n\n应用将关闭并重启。",
+    confirmUpdateBtn:"再次点击以确认",
     tabCabinet:"个人中心", secConnection:"连接",
     cabSubscription:"订阅", cabLoading:"加载中…", cabUpgrade:"升级 / 续费",
     cabLicense:"许可证", cabSaveLicense:"保存许可证", cabLanguage:"语言",
@@ -1326,7 +1330,21 @@ async function checkUpdate() {
 function dismissUpdate() { document.getElementById('update-banner').style.display = 'none'; }
 async function doUpdate() {
   if (!window._updateInfo?.download_url) { toast(t('toastNoUrl'), true); return; }
-  if (!confirm(t('confirmUpdate', {v: window._updateInfo.latest}))) return;
+  // Native confirm()/alert() do not render inside the pywebview (WebView2) window —
+  // they return immediately, so we use an inline two-step confirm on the button itself.
+  const btn = document.getElementById('update-btn');
+  if (!window._updatePending) {
+    window._updatePending = true;
+    if (btn) btn.textContent = t('confirmUpdateBtn');
+    window._updatePendingTimer = setTimeout(() => {
+      window._updatePending = false;
+      if (btn) btn.textContent = t('updateNow');
+    }, 5000);
+    return;
+  }
+  clearTimeout(window._updatePendingTimer);
+  window._updatePending = false;
+  if (btn) { btn.textContent = t('updateNow'); btn.disabled = true; }
   try {
     const r = await fetch('/api/control/update', {
       method: 'POST', headers: {'Content-Type':'application/json'},
