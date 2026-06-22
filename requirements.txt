@@ -1,4 +1,5 @@
 ccxt
+protobuf==5.29.5
 python-dotenv
 rich
 httpx
