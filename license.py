@@ -18,7 +18,7 @@ from appdir import BASE_DIR
 from logsetup import get_logger
 log = get_logger("license")
 
-API_BASE = os.getenv("EYECRYPT_API", "http://127.0.0.1:8000")
+API_BASE = os.getenv("EYECRYPT_API", "https://api.eyecryptbot.com")
 LICENSE = os.getenv("EYECRYPT_LICENSE", "")
 PING_INTERVAL_SEC = 300         # 5 min
 REVERIFY_INTERVAL_SEC = 3600    # re-check subscription every hour

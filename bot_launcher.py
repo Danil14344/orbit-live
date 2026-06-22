@@ -27,7 +27,7 @@ def main():
     if not env_path.exists():
         env_path.write_text(
             "EYECRYPT_LICENSE=paste-your-license-here\n"
-            "EYECRYPT_API=http://127.0.0.1:8000\n"
+            "EYECRYPT_API=https://api.eyecryptbot.com\n"
             "MODE=paper\n",
             encoding="utf-8",
         )

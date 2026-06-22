@@ -16,7 +16,11 @@ from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 
-load_dotenv()
+# override=True: the scanner is respawned by the watchdog to apply a mode/license
+# change saved from the dashboard. Without override, a stale MODE/EYECRYPT_* value
+# inherited from the parent process env would shadow the freshly-written .env, so the
+# switch (e.g. paper→live) would silently never take effect.
+load_dotenv(override=True)
 
 from logsetup import init_logging, get_logger
 init_logging("scanner")

@@ -27,7 +27,7 @@ except Exception:
 
 from appdir import BASE_DIR
 ROOT = BASE_DIR
-VERSION = "1.0.7"   # bumped on each release; auto-update compares this
+VERSION = "1.0.8"   # bumped on each release; auto-update compares this
 DEFAULT_BACKEND = "https://api.eyecryptbot.com"
 
 app = FastAPI()
@@ -1479,7 +1479,16 @@ async function saveSettings() {
     const r = await fetch('/api/settings', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
     const j = await r.json();
     if (!r.ok) return toast(j.error || t('toastFailed'), true);
-    toast(t('toastSaved'));
+    // Settings that change how the scanner runs (mode, backend, sizing) only take
+    // effect after a scanner restart. Trigger it automatically so the user doesn't
+    // have to remember the separate "Restart bot" button — the common complaint was
+    // that switching paper↔live "did nothing" because the running scanner kept going.
+    if (j.restart_required) {
+      try { await fetch('/api/control/restart', { method: 'POST' }); } catch (e) {}
+      toast(t('toastRestarting'));
+    } else {
+      toast(t('toastSaved'));
+    }
     loadStatus();
   } catch (e) { toast(e.message, true); }
 }
@@ -1536,6 +1545,10 @@ async function saveLicense() {
     const r = await fetch('/api/settings', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ license_key: key }) });
     const j = await r.json();
     if (!r.ok) return toast(j.error || t('toastFailed'), true);
+    // Apply the new key by restarting the scanner — the toast already promises this,
+    // but previously nothing actually triggered the restart, so the new tier/license
+    // only took effect on the next manual restart.
+    try { await fetch('/api/control/restart', { method: 'POST' }); } catch (e) {}
     toast(t('toastLicenseSaved'));
     setTimeout(loadCabinet, 800);
     loadStatus();

@@ -18,7 +18,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 APP_NAME = "Eye Crypt Bot"
-APP_VERSION = "1.0.7"   # keep in sync with dashboard.py VERSION
+APP_VERSION = "1.0.8"   # keep in sync with dashboard.py VERSION
 DASHBOARD_PORT = 8765
 DASHBOARD_URL = f"http://127.0.0.1:{DASHBOARD_PORT}"
 
