@@ -27,7 +27,7 @@ except Exception:
 
 from appdir import BASE_DIR
 ROOT = BASE_DIR
-VERSION = "1.0.8"   # bumped on each release; auto-update compares this
+VERSION = "1.0.9"   # bumped on each release; auto-update compares this
 DEFAULT_BACKEND = "https://api.eyecryptbot.com"
 
 app = FastAPI()
@@ -1611,20 +1611,41 @@ async function loadKeys() {
           </div>
           <button class="btn btn-sm btn-sec" onclick="editKey('${k.exchange}', ${k.needs_passphrase})">${k.configured ? t('replace') : t('add')}</button>
         </div>
+        <div id="keyform-${k.exchange}" style="display:none; margin-top:12px;"></div>
       </div>
     `).join('');
   } catch (e) { toast('Failed to load keys', true); }
 }
-async function editKey(exchange, needsPass) {
-  const api_key = prompt(`${exchange.toUpperCase()} — ${t('promptKey')}`);
-  if (!api_key) return;
-  const api_secret = prompt(`${exchange.toUpperCase()} — ${t('promptSecret')}`);
-  if (!api_secret) return;
+// Inline form (no native prompt()): native dialogs are unreliable inside the
+// pywebview/WebView2 desktop window, and the old one-prompt-at-a-time flow made
+// users think there was nowhere to paste the secret. Render all fields at once.
+function editKey(exchange, needsPass) {
+  const box = document.getElementById(`keyform-${exchange}`);
+  if (!box) return;
+  if (box.style.display !== 'none') { box.style.display = 'none'; box.innerHTML = ''; return; }
+  const passField = needsPass
+    ? `<input id="kf-pass-${exchange}" class="field" type="password" autocomplete="off" placeholder="${t('promptPass')}" style="margin-bottom:8px;"/>`
+    : '';
+  box.innerHTML = `
+    <input id="kf-key-${exchange}" class="field" type="text" autocomplete="off" placeholder="${t('promptKey')}" style="margin-bottom:8px;"/>
+    <input id="kf-secret-${exchange}" class="field" type="password" autocomplete="off" placeholder="${t('promptSecret')}" style="margin-bottom:8px;"/>
+    ${passField}
+    <div style="display:flex; gap:8px;">
+      <button class="btn btn-sm" onclick="submitKey('${exchange}', ${needsPass})">${t('save')}</button>
+      <button class="btn btn-sm btn-sec" onclick="editKey('${exchange}', ${needsPass})">✕</button>
+    </div>`;
+  box.style.display = 'block';
+  const k = document.getElementById(`kf-key-${exchange}`); if (k) k.focus();
+}
+async function submitKey(exchange, needsPass) {
+  const api_key = (document.getElementById(`kf-key-${exchange}`).value || '').trim();
+  const api_secret = (document.getElementById(`kf-secret-${exchange}`).value || '').trim();
   let api_passphrase = null;
   if (needsPass) {
-    api_passphrase = prompt(`${exchange.toUpperCase()} — ${t('promptPass')}`);
-    if (!api_passphrase) return;
+    api_passphrase = (document.getElementById(`kf-pass-${exchange}`).value || '').trim();
+    if (!api_passphrase) { toast(t('promptPass'), true); return; }
   }
+  if (!api_key || !api_secret) { toast(t('promptSecret'), true); return; }
   try {
     const r = await fetch('/api/exchange-keys', {
       method: 'POST', headers: {'Content-Type':'application/json'},
