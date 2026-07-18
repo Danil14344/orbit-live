@@ -61,6 +61,41 @@ def _paper_trades_path():
     return os.path.join(os.path.dirname(str(BASE_DIR)), "orbit_paper", "trades.jsonl")
 
 
+def _venue_shares(exids):
+    """{exid: share} of windows per venue (directional stats for seeding)."""
+    cnt = defaultdict(int)
+    total = 0
+    for e in exids:
+        if e:
+            cnt[e] += 1
+            total += 1
+    return {e: n / total for e, n in cnt.items()} if total else {}
+
+
+def seed_venues_for(stats, coverage=0.8, max_venues=2):
+    """Pick the dominant SELL venues covering >= `coverage` of a token's windows.
+    Inventory is only needed on the sell side — seeding the buy side wastes USDT.
+    Returns {exid: weight} with weights renormalized to sum to 1."""
+    shares = stats.get("sell_venues") or {}
+    if not shares:
+        return {}
+    chosen = []
+    acc = 0.0
+    for exid, sh in sorted(shares.items(), key=lambda x: -x[1]):
+        chosen.append((exid, sh))
+        acc += sh
+        if acc >= coverage or len(chosen) >= max_venues:
+            break
+    tot = sum(sh for _, sh in chosen) or 1.0
+    return {exid: sh / tot for exid, sh in chosen}
+
+
+def buy_venues_for(stats, min_share=0.25):
+    """Venues that act as the BUY side for a meaningful share of windows —
+    these need free USDT kept on them (per-venue reserve floor)."""
+    return {e for e, sh in (stats.get("buy_venues") or {}).items() if sh >= min_share}
+
+
 def analyze_paper(path, lookback_h, min_windows, window_gap_sec=600):
     """Return ranked list of (token, {windows, trades, pnl, avg_net}) for tokens
     that produced recurring windows on the live route within lookback."""
@@ -98,7 +133,9 @@ def analyze_paper(path, lookback_h, min_windows, window_gap_sec=600):
         pnl = sum(x.get("actual_pnl_usd", 0) for x in rs)
         if windows >= min_windows:
             out.append((tok, {"windows": windows, "trades": len(rs),
-                              "pnl": pnl, "avg_net": sum(nets) / len(nets) if nets else 0}))
+                              "pnl": pnl, "avg_net": sum(nets) / len(nets) if nets else 0,
+                              "sell_venues": _venue_shares(x.get("sell_ex") for x in rs),
+                              "buy_venues": _venue_shares(x.get("buy_ex") for x in rs)}))
     # rank: more windows first, then pnl
     out.sort(key=lambda x: (x[1]["windows"], x[1]["pnl"]), reverse=True)
     return out
@@ -137,7 +174,7 @@ def analyze_shadow(path, lookback_h, min_windows, min_net_pct=0.0, window_gap_se
                 tok = sym.split("/")[0]
                 net = r.get("net_pct", r.get("real_net_pct", 0)) or 0
                 pnl = r.get("would_pnl_usd", 0) or 0
-                by_tok[tok].append((r["ts"], net, pnl))
+                by_tok[tok].append((r["ts"], net, pnl, r.get("buy_ex"), r.get("sell_ex")))
     except FileNotFoundError:
         log.warning(f"shadow log not found: {path}")
         return []
@@ -174,7 +211,9 @@ def analyze_shadow(path, lookback_h, min_windows, min_net_pct=0.0, window_gap_se
         if windows >= min_windows or len(qual) >= min_trades:
             out.append((tok, {"windows": windows, "trades": len(qual), "pnl": pnl,
                               "avg_net": sum(nets) / len(nets),
-                              "median_net": med_net}))
+                              "median_net": med_net,
+                              "sell_venues": _venue_shares(x[4] for x in qual),
+                              "buy_venues": _venue_shares(x[3] for x in qual)}))
     # rank by captured-able money (sum of above-threshold would-pnl), then windows
     out.sort(key=lambda x: (x[1]["pnl"], x[1]["windows"]), reverse=True)
     return out
@@ -318,24 +357,33 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
         return None
 
     # held inventory value per token (across live route)
-    def held_usd(tok):
+    def held_usd(tok, venues=None):
         m = _mark(hub, tok)
-        return sum((bc.available(exid, tok) or 0) for exid in LIVE_ROUTE) * m
+        return sum((bc.available(exid, tok) or 0) for exid in (venues or LIVE_ROUTE)) * m
 
-    # capacity: how many tokens can we actually fund without breaching the USDT reserve?
-    # (don't chase more tokens than the depo can seed on both legs — avoids perpetual
-    #  "add=[X] -> skip reserve" churn for tokens that will never fit.)
+    # DIRECTIONAL seeding: inventory is only needed on the SELL side of a token's
+    # windows; the BUY side needs free USDT. Seeding all venues 3x-ed the cost of a
+    # token and capped the depo at 1 whitelisted token while thousands of windows
+    # went to shadow. seed_plan: tok -> {exid: usd_target}.
+    dir_coverage = _f("REBALANCE_DIR_COVERAGE", "0.8")
+    max_seed_venues = _i("REBALANCE_MAX_SEED_VENUES", "2")
+    buy_floor_usd = _f("REBALANCE_BUY_FLOOR_USD", str(_f("POSITION_USD", "15") * 1.5))
+
+    # capacity: budget-based — walk ranked candidates and stop when the deployable
+    # capital is spoken for (per-token cost is now its actual directional seed cost,
+    # not per_token × all venues).
     _usdt = sum((bc.available(e, "USDT") or 0) for e in LIVE_ROUTE)
     _cap = _usdt + sum(held_usd(t) for t in (set(WHITELIST_TOKENS) | {x[0] for x in ranked}))
     _deployable = _cap * (1 - reserve_pct / 100)
-    max_fundable = max(1, int(_deployable // (per_token_usd * len(LIVE_ROUTE))))
-    cap_tokens = min(max_tokens, max_fundable)
+    budget_left = _deployable
 
-    # liquidity-filter candidates until we have cap_tokens
+    # liquidity-filter candidates until the budget or max_tokens is exhausted
     target = []
+    seed_plan = {}      # tok -> {exid: usd}
+    buy_side_floors = defaultdict(float)   # exid -> USDT floor demanded by targets
     from executor import BANNED_TOKENS, MAJOR_TOKENS, PHANTOM_BANNED_UNTIL
     for tok, stats in ranked:
-        if len(target) >= cap_tokens:
+        if len(target) >= max_tokens or budget_left < per_token_usd * 0.5:
             break
         if tok in BANNED_TOKENS:
             log.info(f"[REBAL] skip {tok}: banned")
@@ -357,13 +405,18 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
             log.info(f"[REBAL] skip {tok}: phantom soft-ban (stale-feed strikes)")
             continue
         sym = f"{tok}/USDT"
+        venues = seed_venues_for(stats, dir_coverage, max_seed_venues)
+        if not venues:
+            # no directional data (old-format shadow rows) — fall back to all venues
+            venues = {exid: 1.0 / len(LIVE_ROUTE) for exid in LIVE_ROUTE}
+        plan = {exid: per_token_usd * w for exid, w in venues.items()}
         ok_all = True
-        for exid in LIVE_ROUTE:
+        for exid, usd in plan.items():
             ex = ex_by_id.get(exid)
             if ex is None or sym not in (ex.markets or {}):
                 ok_all = False
                 break
-            ok, _top = await _book_supports(ex, sym, per_token_usd, slip_cap)
+            ok, _top = await _book_supports(ex, sym, usd, slip_cap)
             if not ok:
                 ok_all = False
                 break
@@ -386,10 +439,15 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
                          f"(short hedge would bleed)")
                 continue
             target.append(tok)
+            seed_plan[tok] = plan
+            budget_left -= sum(plan.values())
+            for exid in buy_venues_for(stats):
+                buy_side_floors[exid] = max(buy_side_floors[exid], buy_floor_usd)
             log.info(f"[REBAL] candidate {tok}: windows={stats['windows']} trades={stats['trades']} "
                      f"pnl=${stats['pnl']:.2f} median_net={stats.get('median_net', 0):.2f}% "
                      f"avg_net={stats['avg_net']:.2f}% funding={'' if fr_pct is None else f'{fr_pct:.3f}%'} "
-                     f"— liquidity OK")
+                     f"seed={{{', '.join(f'{e}:${u:.0f}' for e, u in plan.items())}}} "
+                     f"buy_side={sorted(buy_venues_for(stats))} — liquidity OK")
         else:
             log.info(f"[REBAL] skip {tok}: insufficient liquidity for ${per_token_usd:.0f} within {slip_cap}%")
 
@@ -418,7 +476,10 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
                 pass
     executor._rebal_notified = set(target_set)
 
-    to_add = [t for t in target if held_usd(t) < per_token_usd * 0.5]   # under half target => top up
+    # under half of the DIRECTIONAL target (inventory on the sell venues) => top up.
+    # Inventory parked on a non-sell venue doesn't count — it can't be traded there.
+    to_add = [t for t in target
+              if held_usd(t, list(seed_plan.get(t, {}))) < sum(seed_plan.get(t, {}).values()) * 0.5]
     # drop: held/whitelisted tokens no longer in target, with hysteresis
     candidates_drop = [t for t in current if t not in target_set]
     # Orphans: tokens actually HELD on the live route that are neither whitelisted
@@ -465,10 +526,47 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
                     log.error(f"[REBAL] sell {tok}@{exid} failed: {str(e)[:80]}")
         off_target_streak.pop(tok, None)
 
+    # --- RELOCATE: target-token inventory sitting on a venue that is NOT one of its
+    # sell venues is dead capital (executor can't use it there) — liquidate it so the
+    # USDT can fund the directional seed. Same grace machinery, keyed tok@venue.
+    relocated = False
+    for tok in target_set:
+        plan_venues = set(seed_plan.get(tok, {}))
+        if not plan_venues:
+            continue
+        for exid in LIVE_ROUTE:
+            if exid in plan_venues:
+                off_target_streak.pop(f"{tok}@{exid}", None)
+                continue
+            if held_usd(tok, [exid]) < 5.0:
+                off_target_streak.pop(f"{tok}@{exid}", None)
+                continue
+            key = f"{tok}@{exid}"
+            off_target_streak[key] = off_target_streak.get(key, 0) + 1
+            if off_target_streak[key] < drop_grace:
+                continue
+            ex = ex_by_id.get(exid)
+            if ex is None:
+                continue
+            try:
+                log.info(f"[REBAL] relocate {tok}: selling off-direction inventory @{exid} "
+                         f"(sell venues: {sorted(plan_venues)})")
+                _u, q, p = await _sell_all(ex, tok, slip_cap, bc, dry)
+                if not dry and q > 0:
+                    relocated = True
+                    if getattr(executor, "guard", None) is not None:
+                        try:
+                            executor.guard.on_fill(exid, tok, "sell", q, p or _mark(hub, tok))
+                        except Exception as e:
+                            log.debug(f"[REBAL] guard.on_fill(relocate) failed: {str(e)[:60]}")
+                off_target_streak.pop(key, None)
+            except Exception as e:
+                log.error(f"[REBAL] relocate sell {tok}@{exid} failed: {str(e)[:80]}")
+
     # Sells just freed USDT but the 30s-cached balances don't see it yet — refresh
     # NOW so the buy leg below can spend the proceeds in the SAME pass instead of
     # stranding the capital until the next one.
-    if to_drop and not dry:
+    if (to_drop or relocated) and not dry:
         try:
             await bc.refresh_all()
             total_usdt = sum((bc.available(exid, "USDT") or 0) for exid in LIVE_ROUTE)
@@ -493,7 +591,7 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
             # seeds we're about to place. Otherwise free_fut after a sweep is ~$0 and the
             # whole pass seeds nothing while spot USDT sits idle — the no-trades deadlock.
             hedgeable_add = [t for t in to_add if hedge.can_hedge(t)]
-            want_margin = (len(hedgeable_add) * per_token_usd * len(LIVE_ROUTE) / max(lev, 1)) if hedgeable_add else 0.0
+            want_margin = sum(sum(seed_plan.get(t, {}).values()) for t in hedgeable_add) / max(lev, 1)
             if want_margin > 0:
                 free_fut = await hedge.ensure_free_margin(want_margin)
             else:
@@ -507,17 +605,31 @@ async def rebalance_once(executor, hedge, hub, ex_by_id, off_target_streak):
     for tok in to_add:
         sym = f"{tok}/USDT"
         hedgeable = hedge is not None and hedge.can_hedge(tok)
-        for exid in LIVE_ROUTE:
+        for exid, venue_target in seed_plan.get(tok, {}).items():
             ex = ex_by_id.get(exid)
             if ex is None or sym not in (ex.markets or {}):
                 continue
             usdt_here = bc.available(exid, "USDT") or 0
-            need = per_token_usd - (bc.available(exid, tok) or 0) * _mark(hub, tok)
+            need = venue_target - (bc.available(exid, tok) or 0) * _mark(hub, tok)
             if need <= 1:
                 continue
             if (total_usdt - spent - need) < reserve_floor:
                 log.info(f"[REBAL] skip buy {tok}@{exid}: would breach USDT reserve")
                 continue
+            # Per-venue buy-side floor: this venue is the BUY leg for some target
+            # token's windows — leave it enough free USDT to actually take trades.
+            # A global reserve spread over 3 venues kept "reserve OK" while the one
+            # venue that needed USDT sat starved.
+            v_floor = buy_side_floors.get(exid, 0.0)
+            if v_floor > 0 and (usdt_here - need) < v_floor:
+                shrunk = usdt_here - v_floor
+                if shrunk < 5.0:
+                    log.info(f"[REBAL] skip buy {tok}@{exid}: would breach buy-side USDT "
+                             f"floor (${usdt_here:.0f} here, floor ${v_floor:.0f})")
+                    continue
+                log.info(f"[REBAL] cap buy {tok}@{exid}: ${need:.0f} -> ${shrunk:.0f} "
+                         f"(buy-side floor ${v_floor:.0f})")
+                need = shrunk
             # Cap hedgeable seeds to remaining hedge capacity.
             if hedgeable:
                 remaining_hedge = hedge_cap_usd - hedgeable_spent

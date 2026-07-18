@@ -17,6 +17,54 @@ def taker_fee_for(ex_id: str) -> float:
     return TAKER_FEES.get(ex_id, DEFAULT_TAKER_FEE)
 
 
+async def probe_taker_fees(ex_by_id, log=None):
+    """One-shot: fetch each venue's ACTUAL taker fee for THIS account (VIP tier,
+    zero-fee campaigns, MX/BGB deduction…) and override the static defaults.
+    A 0.05pp overestimate on the fee floor silently filters real windows at a
+    0.3% net threshold; an underestimate books phantom profit. Explicit
+    TAKER_FEE_<EX> env still wins. Values outside (0, 1%) are ignored."""
+    import statistics
+    for exid, ex in ex_by_id.items():
+        if os.getenv(f"TAKER_FEE_{exid.upper()}"):
+            continue    # operator override wins
+        if not getattr(ex, "apiKey", None):
+            continue
+        try:
+            takers = []
+            has = getattr(ex, "has", {}) or {}
+            if has.get("fetchTradingFees"):
+                try:
+                    fees = await asyncio.wait_for(ex.fetch_trading_fees(), timeout=15)
+                    takers = [f.get("taker") for f in (fees or {}).values()
+                              if isinstance(f, dict) and isinstance(f.get("taker"), (int, float))]
+                except Exception as e:
+                    if log:
+                        log.debug(f"[FEE PROBE] {exid} fetch_trading_fees: {str(e)[:60]}")
+            if not takers and has.get("fetchTradingFee"):
+                # fallback: single liquid symbol — fee tier is account-wide on spot
+                for probe_sym in ("BTC/USDT", "ETH/USDT"):
+                    try:
+                        f = await asyncio.wait_for(ex.fetch_trading_fee(probe_sym), timeout=15)
+                        if isinstance(f, dict) and isinstance(f.get("taker"), (int, float)):
+                            takers = [f["taker"]]
+                            break
+                    except Exception:
+                        continue
+            if not takers:
+                continue
+            t = float(statistics.median(takers))
+            if not (0.0 <= t < 0.01):
+                continue
+            old = taker_fee_for(exid)
+            if abs(t - old) >= 1e-6:
+                TAKER_FEES[exid] = t
+                if log:
+                    log.info(f"[FEE PROBE] {exid}: taker {old*100:.3f}% -> {t*100:.3f}% (account-actual)")
+        except Exception as e:
+            if log:
+                log.warning(f"[FEE PROBE] {exid} failed: {str(e)[:80]}")
+
+
 def vwap_buy(asks, target_usd):
     """Walk asks ladder buying for target_usd worth. Returns (avg_price, base_filled, usd_filled, fully_filled)."""
     spent = 0.0

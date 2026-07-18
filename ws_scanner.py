@@ -971,6 +971,13 @@ async def main():
     console.print(f"[cyan]InventoryGuard: stop {guard.cfg.default_threshold_pct}%, cooldown {guard.cfg.cooldown_after_stop_sec}s[/cyan]")
     console.print(f"[cyan]Capital: total=${executor.cfg.total_capital_usd}, reserve={executor.cfg.reserve_pct*100:.0f}%, max/token=${executor.cfg.max_position_per_token_usd}[/cyan]")
 
+    # One-shot: pull the account's ACTUAL taker fees (campaigns/VIP/deduction)
+    # so the net-edge floor matches reality instead of static defaults.
+    from depth import probe_taker_fees
+    from logsetup import get_logger as _gl
+    feeders.append(asyncio.create_task(probe_taker_fees(
+        {i: e for i, e in ex_by_id.items() if getattr(e, "apiKey", None)}, log=_gl("fees"))))
+
     feeders.append(asyncio.create_task(env_watch_loop()))
     feeders.append(asyncio.create_task(time_sync_loop(exchanges, interval_sec=300)))
     feeders.append(asyncio.create_task(leg_risk_logger(executor, interval_sec=float(os.getenv("LEGRISK_LOG_SEC", "900")))))
