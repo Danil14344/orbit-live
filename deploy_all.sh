@@ -18,7 +18,9 @@ echo "==== [2/5] python venv + deps ===="
 
 echo "==== [3/5] restore .env from secrets.enc ===="
 if [ ! -s .env ]; then
-  read -s -p "Paste PASSPHRASE then Enter: " SECRETS_PASS; echo
+  if [ -z "$SECRETS_PASS" ]; then
+    read -s -p "Paste PASSPHRASE then Enter: " SECRETS_PASS; echo
+  fi
   SECRETS_PASS="$SECRETS_PASS" .venv/bin/python unmake_secrets.py
 else
   echo ".env already present, skipping"
