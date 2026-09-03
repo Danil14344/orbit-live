@@ -20,7 +20,7 @@ payload = json.dumps({
     "backend_env": open(BACKEND_ENV, "r", encoding="utf-8").read(),
 }).encode()
 
-passphrase = base64.urlsafe_b64encode(secrets.token_bytes(24)).decode().rstrip("=")
+passphrase = sys.argv[1] if len(sys.argv) > 1 else base64.urlsafe_b64encode(secrets.token_bytes(24)).decode().rstrip("=")
 salt  = secrets.token_bytes(16)
 nonce = secrets.token_bytes(12)
 key = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=200_000).derive(passphrase.encode())
